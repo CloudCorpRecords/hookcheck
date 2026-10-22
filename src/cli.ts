@@ -4,10 +4,52 @@
  *   hookcheck scan [path] [--json]
  *   hookcheck mcp
  *   hookcheck --version
- * Exit codes: 0 CLEAN, 1 REVIEW or COMPROMISED-PATTERN, 2 usage error.
+ * Exit codes: 0 CLEAN, 1 REVIEW or COMPROMISED-PATTERN, 2 usage error,
+ * 141 when the reader closed the output pipe before the report was
+ * delivered (the shell-visible equivalent of death by SIGPIPE).
+ *
+ * Every report goes through emit(), which waits for stdout to flush
+ * before the exit code takes effect. This is the factory emit
+ * contract (~/workspace/security-wave/FACTORY-NOTES.md). The P-017 fix
+ * in v0.1.3 replaced process.exit() with process.exitCode, which made
+ * delivery reliable for cooperative readers, but the CLI still printed
+ * with console.log and had no EPIPE handling at all: on a very large
+ * report (35 MB on the chaos big-workflow target), a reader that
+ * closed the pipe early still received the verdict exit code,
+ * reporting silent truncation as success (P-071). Sibling tools
+ * actionpin (P-001) and injectcheck (P-021) exit 141 in that case;
+ * hookcheck now does the same.
  */
 import { existsSync, statSync } from "node:fs";
 import { explainHook, renderReport, scanHooks, VERSION } from "./core.js";
+
+function exitBrokenPipe(): never {
+  // The reader closed the pipe before the report was delivered. A Unix
+  // writer in this position dies from SIGPIPE; exit 141 (128 + 13) is
+  // the equivalent a shell reports, and it guarantees an undelivered
+  // report is never mistaken for a successful run.
+  process.exit(141);
+}
+
+process.stdout.on("error", (err: NodeJS.ErrnoException) => {
+  if (err.code === "EPIPE") exitBrokenPipe();
+  throw err;
+});
+
+/** Write one full report and resolve only after stdout has flushed it. */
+async function emit(text: string, code: number): Promise<void> {
+  process.exitCode = code;
+  await new Promise<void>((resolve, reject) => {
+    process.stdout.write(`${text}\n`, (err) => {
+      if (!err) {
+        resolve();
+        return;
+      }
+      if ((err as NodeJS.ErrnoException).code === "EPIPE") exitBrokenPipe();
+      reject(err);
+    });
+  });
+}
 
 /** A scan target must be an existing directory; anything else is a usage error (exit 2). */
 function requireDirectory(target: string): void {
@@ -43,14 +85,7 @@ async function main(): Promise<void> {
       const target = rest.find((a) => !a.startsWith("--")) ?? ".";
       requireDirectory(target);
       const report = scanHooks(target);
-      if (asJson) console.log(JSON.stringify(report, null, 2));
-      else console.log(renderReport(report));
-      // exitCode, not process.exit: stdout to a pipe is async in Node, and
-      // process.exit right after console.log truncates large reports at
-      // exactly 65,536 characters (measured during v0.1.2 re-validation
-      // on a sparse cli/cli checkout). Letting main return lets the
-      // runtime flush stdout in full before exiting with this code.
-      process.exitCode = report.verdict === "CLEAN" ? 0 : 1;
+      await emit(asJson ? JSON.stringify(report, null, 2) : renderReport(report), report.verdict === "CLEAN" ? 0 : 1);
     } else if (cmd === "explain") {
       const args = rest.filter((a) => !a.startsWith("--"));
       const asJson = rest.includes("--json");
@@ -60,9 +95,7 @@ async function main(): Promise<void> {
       else usage();
       requireDirectory(target);
       const result = explainHook(target, id);
-      if (asJson) console.log(JSON.stringify(result, null, 2));
-      else console.log(result.explanation);
-      process.exitCode = result.finding ? 0 : 1;
+      await emit(asJson ? JSON.stringify(result, null, 2) : result.explanation, result.finding ? 0 : 1);
     } else {
       usage();
     }

@@ -146,21 +146,23 @@ describe("P-065: every root surface is inventoried when nested", () => {
 });
 
 describe("P-065: the bounded walk says so when the bound cuts the tree", () => {
-  it("a surface at project depth 4 is in; deeper surfaces are out and the depth bound is warned by name", () => {
+  it("a surface at project depth 8 is in; deeper surfaces are out and the depth bound is warned by name", () => {
+    // The bound was 4 in v0.1.8 and is 8 since v0.1.9 (P-072); this
+    // test's fixture depths move with the bound.
     const dir = fx({
-      "a/b/c/d/.claude/settings.json": SETTINGS,
-      "a/b/c/d/e/f/.claude/settings.json": SETTINGS,
+      "a/b/c/d/e/f/g/h/.claude/settings.json": SETTINGS,
+      "a/b/c/d/e/f/g/h/i/j/.claude/settings.json": SETTINGS,
     });
     const r = scanHooks(dir);
-    assert.ok(r.findings.some((f) => f.file === "a/b/c/d/.claude/settings.json"), `files ${r.findings.map((f) => f.file).join(", ")}`);
-    assert.ok(!r.findings.some((f) => f.file.includes("/e/f/")), "depth 6 surface must stay outside the bound");
-    assert.ok(r.warnings.some((w) => /depth 4/i.test(w) && /bound/i.test(w)), `warnings: ${r.warnings.join(" | ")}`);
+    assert.ok(r.findings.some((f) => f.file === "a/b/c/d/e/f/g/h/.claude/settings.json"), `files ${r.findings.map((f) => f.file).join(", ")}`);
+    assert.ok(!r.findings.some((f) => f.file.includes("/i/j/")), "depth 10 surface must stay outside the bound");
+    assert.ok(r.warnings.some((w) => /depth 8/i.test(w) && /bound/i.test(w)), `warnings: ${r.warnings.join(" | ")}`);
   });
 
   it("surfaces just below the bound are reported, and the scan does not present as a bare CLEAN", () => {
-    const dir = fx({ "a/b/c/d/e/package.json": JSON.stringify({ name: "deep", scripts: { postinstall: CURL_PIPE } }) });
+    const dir = fx({ "a/b/c/d/e/f/g/h/i/package.json": JSON.stringify({ name: "deep", scripts: { postinstall: CURL_PIPE } }) });
     const r = scanHooks(dir);
-    assert.equal(r.counts.total, 0, "the depth 5 package stays outside the bound");
+    assert.equal(r.counts.total, 0, "the depth 9 package stays outside the bound");
     assert.ok(r.warnings.some((w) => /bound/i.test(w)), `warnings: ${r.warnings.join(" | ")}`);
     assert.notEqual(r.verdict, "CLEAN", "a bounded scan that saw surfaces below the bound must not verdict a bare CLEAN");
   });

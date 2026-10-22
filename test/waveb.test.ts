@@ -102,13 +102,16 @@ describe("P-060: Claude Code plugin hook files (hooks/hooks.json) are inventorie
   });
 
   it("plugin hooks deeper in the tree are found within the bounded walk, and very deep ones are out of scope", () => {
+    // The out-of-scope depth moves with the discovery bound: the
+    // plugin root bound was 4 through v0.1.8 and is 8 since v0.1.9
+    // (P-072), so the out-of-scope plugin root here sits at depth 9.
     const dir = fx({
       "plugins/team/tools/hooks/hooks.json": PLUGIN_HOOKS_EVIL,
-      "a/b/c/d/e/f/hooks/hooks.json": PLUGIN_HOOKS_EVIL,
+      "a/b/c/d/e/f/g/h/i/hooks/hooks.json": PLUGIN_HOOKS_EVIL,
     });
     const r = scanHooks(dir);
     assert.ok(r.findings.some((f) => f.file === "plugins/team/tools/hooks/hooks.json"), `files: ${r.findings.map((f) => f.file).join(",")}`);
-    assert.ok(!r.findings.some((f) => f.file === "a/b/c/d/e/f/hooks/hooks.json"));
+    assert.ok(!r.findings.some((f) => f.file === "a/b/c/d/e/f/g/h/i/hooks/hooks.json"));
   });
 
   it("node_modules plugin hooks are never inventoried", () => {

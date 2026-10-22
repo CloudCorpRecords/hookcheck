@@ -8,7 +8,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type { Classification, HookFinding, HookSource, ScanReport, Verdict } from "./types.js";
 
-export const VERSION = "0.1.8";
+export const VERSION = "0.1.9";
 
 interface RuleDef {
   id: string;
@@ -664,9 +664,20 @@ const CRED_ENV_NAME = /(SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|ACCES
  * those spans, and matches that start inside a quoted data literal
  * (an echo string, a pattern list), are skipped.
  */
-function detectEnvAccess(cmd: string, dataRanges: TextRange[]): { cred: boolean; bulk: boolean } {
+function detectEnvAccess(cmd: string, dataRanges: TextRange[]): { cred: boolean; bulk: boolean; bulkInheritanceOnly: boolean } {
   let cred = false;
   let bulk = false;
+  // Bulk form tracking (P-091): the evidence sentence must describe
+  // the form that actually fired. A spread ({**os.environ, ...}), a
+  // dict() or list() copy, or an os.environ.copy() handed on (the
+  // environment inheritance idiom, typically as a subprocess env=) is
+  // bulk access, but it is not a serialization or a dump, and the
+  // v0.1.8 evidence called every bulk form one. bulkInheritanceOnly
+  // is true when every bulk hit is an inheritance or copy form and no
+  // serialization or dump form (JSON.stringify, printenv, a bare env
+  // statement, str(os.environ)) fired.
+  let bulkDump = false;
+  let bulkCopy = false;
   const skipSpans: TextRange[] = [
     ...Array.from(cmd.matchAll(/\benv(?:\s+-u\s+[A-Za-z_][A-Za-z0-9_]*)+/g), (m) => ({ start: m.index, end: m.index + m[0].length })),
     ...Array.from(cmd.matchAll(/\[\[?\s+-[nz]\s+"?\$\{?[A-Za-z_][A-Za-z0-9_]*\}?"?\s*\]\]?/g), (m) => ({ start: m.index, end: m.index + m[0].length })),
@@ -690,10 +701,11 @@ function detectEnvAccess(cmd: string, dataRanges: TextRange[]): { cred: boolean;
       if (CRED_ENV_NAME.test(m[1])) cred = true;
     }
   }
-  if (/(JSON\.stringify|Object\.(keys|values|entries|assign)|util\.inspect)\s*\([^)]*(process\.env|os\.environ)/.test(cmd)) bulk = true;
-  if (/\bprintenv\b/.test(cmd) && !inRanges(cmd.search(/\bprintenv\b/), dataRanges)) bulk = true;
-  if (/(^|[;&|]\s*)env\s*($|[|>;])/m.test(cmd)) bulk = true;
-  if (/\b(str|dict|list)\s*\(\s*os\.environ\s*\)/.test(cmd)) bulk = true;
+  if (/(JSON\.stringify|Object\.(keys|values|entries|assign)|util\.inspect)\s*\([^)]*(process\.env|os\.environ)/.test(cmd)) { bulk = true; bulkDump = true; }
+  if (/\bprintenv\b/.test(cmd) && !inRanges(cmd.search(/\bprintenv\b/), dataRanges)) { bulk = true; bulkDump = true; }
+  if (/(^|[;&|]\s*)env\s*($|[|>;])/m.test(cmd)) { bulk = true; bulkDump = true; }
+  if (/\bstr\s*\(\s*os\.environ\s*\)/.test(cmd)) { bulk = true; bulkDump = true; }
+  if (/\b(?:dict|list)\s*\(\s*os\.environ\s*\)/.test(cmd)) { bulk = true; bulkCopy = true; }
   // Whole os.environ use (P-020): scan every occurrence and judge the
   // operation that follows it, instead of one negative lookahead.
   const envRe = /\bos\.environ\b/g;
@@ -704,15 +716,92 @@ function detectEnvAccess(cmd: string, dataRanges: TextRange[]): { cred: boolean;
     if (/^\s*\.get\s*\(/.test(after)) continue; // named read, judged above
     if (/^\s*\[/.test(after)) continue; // named subscript read
     if (/^\s*\.(?:setdefault|pop|update)\s*\(/.test(after)) continue; // write or removal, not a read
-    if (/^\s*\.copy\s*\(/.test(after)) { bulk = true; continue; } // whole copy is a bulk read
+    if (/^\s*\.copy\s*\(/.test(after)) { bulk = true; bulkCopy = true; continue; } // whole copy is a bulk read
     const before = cmd.slice(Math.max(0, em.index - 24), em.index);
     if (/env\s*=\s*$/.test(before)) continue; // subprocess env inheritance
     bulk = true;
+    // A spread occurrence ({**os.environ, ...}) is the inheritance
+    // idiom in dict form; anything else here is an unqualified whole
+    // environment use, counted with the dump forms for wording.
+    if (/\*\*\s*$/.test(before)) bulkCopy = true; else bulkDump = true;
   }
-  return { cred, bulk };
+  return { cred, bulk, bulkInheritanceOnly: bulk && bulkCopy && !bulkDump };
 }
 
-interface Atom extends TextRange { kind: "cred" | "bulk"; inData: boolean }
+interface Atom extends TextRange {
+  kind: "cred" | "bulk";
+  inData: boolean;
+  /**
+   * True when this bulk atom sits inside an environment inheritance
+   * expression (P-091): a spread ({**os.environ, ...} or
+   * {...process.env}), dict(os.environ), os.environ.copy(), or a bare
+   * os.environ / process.env value, where that expression is passed
+   * as a subprocess env= (directly, or via a variable assigned from
+   * it). Inheritance moves the environment into a child process the
+   * code itself starts; it is not serialization into a payload.
+   */
+  pure?: boolean;
+}
+
+/**
+ * Text ranges of environment inheritance expressions that are passed
+ * as a subprocess environment (P-091). Two shapes count: a value used
+ * directly as env= or env: (env={**os.environ, ...},
+ * env=os.environ.copy()), and a variable assigned from an inheritance
+ * expression that is itself passed as env= somewhere in the same
+ * text (ENV = {**os.environ, ...}; subprocess.Popen(..., env=ENV)).
+ * The same forms in any other position (a request body, a printed
+ * value) are NOT inheritance ranges: dict(os.environ) handed to
+ * requests.post as data is serialization into a payload and keeps
+ * full exfil weight.
+ */
+function isInheritanceExpr(expr: string): boolean {
+  const t = expr.trim();
+  if (/^(?:os\.environ|process\.env)$/.test(t)) return true;
+  if (/^(?:os\.environ|process\.env)\.copy\(\s*\)$/.test(t)) return true;
+  if (/^dict\(\s*(?:os\.environ|process\.env)\s*\)$/.test(t)) return true;
+  if (/^Object\.assign\(\s*\{\s*\}\s*,\s*(?:process\.env|os\.environ)\b/.test(t)) return true;
+  if (t.startsWith("{") && (/\*\*\s*(?:os\.environ|process\.env)\b/.test(t) || /\.\.\.\s*(?:process\.env|os\.environ)\b/.test(t))) return true;
+  return false;
+}
+
+function inheritanceRanges(text: string): TextRange[] {
+  const ranges: TextRange[] = [];
+  for (const m of text.matchAll(/\benv\s*[:=]\s*/g)) {
+    const start = m.index + m[0].length;
+    const end = consumeValueExpr(text, start);
+    if (end > start && isInheritanceExpr(text.slice(start, end))) ranges.push({ start, end });
+  }
+  const assignRe = /(?:^|[;\n,])\s*(?:export\s+|const\s+|let\s+|var\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*=(?![=<>])\s*/g;
+  let m: RegExpExecArray | null;
+  while ((m = assignRe.exec(text)) !== null) {
+    const rhsStart = m.index + m[0].length;
+    const end = consumeValueExpr(text, rhsStart);
+    if (end <= rhsStart) continue;
+    if (!isInheritanceExpr(text.slice(rhsStart, end))) continue;
+    const name = m[1].replace(/\$/g, "\\$");
+    if (new RegExp(`\\benv\\s*[:=]\\s*(?:${name}\\b|\\{[^}]*\\b${name}\\b)`).test(text)) {
+      ranges.push({ start: rhsStart, end });
+    }
+  }
+  return ranges;
+}
+
+/**
+ * True when every network destination visible in the text is
+ * loopback and at least one destination is visible at all (P-091).
+ * Destinations are URL hosts plus netcat target hosts. An unknown
+ * destination (a URL held in a variable) is not loopback-only: the
+ * discount applies only when the flow's destinations are provably
+ * all local, the same standard as the P-004 loopback downgrade.
+ */
+function loopbackOnlyDestinations(text: string): boolean {
+  const hosts: string[] = [];
+  for (const m of text.matchAll(/https?:\/\/([^\s"'`\/:?#]+)/g)) hosts.push(m[1]);
+  for (const m of text.matchAll(/\b(?:nc|netcat)\s+(?:-\S+\s+)*([A-Za-z0-9._-]+)/g)) hosts.push(m[1]);
+  if (hosts.length === 0) return false;
+  return hosts.every((h) => isLoopbackHost(h));
+}
 
 /**
  * Credential value atoms: text positions where a credential shaped env
@@ -966,14 +1055,19 @@ function authRanges(text: string): TextRange[] {
 }
 
 /**
- * Variables assigned (transitively) from a credential value expression.
+ * Variables assigned (transitively) from a credential value expression,
+ * mapped to their inheritance purity (P-091): a variable is pure when
+ * every taint source in its assignment chain is an inheritance atom
+ * or another pure variable (ENV = {**os.environ, ...} is pure; a
+ * payload built by serializing that same environment is not, because
+ * the serializing atom in its own right-hand side is impure).
  * References inside authentication positions do not propagate taint
  * (P-061): a headers dict whose only credential use is its
  * Authorization value is an authentication container, not a tainted
  * payload, and passing it to fetch does not become exfil.
  */
-function taintedVars(text: string, atoms: Atom[], dataRanges: TextRange[], auth: TextRange[] = []): Set<string> {
-  const tainted = new Set<string>();
+function taintedVars(text: string, atoms: Atom[], dataRanges: TextRange[], auth: TextRange[] = []): Map<string, boolean> {
+  const tainted = new Map<string, boolean>();
   const assignRe = /(?:^|[;\n,])\s*(?:export\s+|const\s+|let\s+|var\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*=(?![=<>])\s*/g;
   const assigns: Array<{ name: string; rhsStart: number; rhsEnd: number }> = [];
   let m: RegExpExecArray | null;
@@ -987,11 +1081,15 @@ function taintedVars(text: string, atoms: Atom[], dataRanges: TextRange[], auth:
   for (let pass = 0; pass < 4; pass++) {
     for (const a of assigns) {
       if (tainted.has(a.name)) continue;
-      if (live.some((x) => x.start >= a.rhsStart && x.start < a.rhsEnd)) { tainted.add(a.name); continue; }
-      const rhs = text.slice(a.rhsStart, a.rhsEnd);
-      for (const v of tainted) {
-        if (refOutsideRanges(rhs, v, a.rhsStart, [...dataRanges, ...auth])) { tainted.add(a.name); break; }
+      const sources: boolean[] = [];
+      for (const x of live) {
+        if (x.start >= a.rhsStart && x.start < a.rhsEnd) sources.push(x.pure === true);
       }
+      const rhs = text.slice(a.rhsStart, a.rhsEnd);
+      for (const [v, vPure] of tainted) {
+        if (refOutsideRanges(rhs, v, a.rhsStart, [...dataRanges, ...auth])) sources.push(vPure);
+      }
+      if (sources.length > 0) tainted.set(a.name, sources.every(Boolean));
     }
   }
   return tainted;
@@ -1015,14 +1113,31 @@ function callSpan(text: string, openIdx: number): TextRange {
   return { start: openIdx, end: text.length };
 }
 
-function spanHasTaint(text: string, span: TextRange, atoms: Atom[], tainted: Set<string>, dataRanges: TextRange[], auth: TextRange[] = []): boolean {
-  if (atoms.some((a) => !a.inData && a.start >= span.start && a.start < span.end)) return true;
-  if (tainted.size === 0) return false;
-  const seg = text.slice(span.start, span.end);
-  for (const v of tainted) {
-    if (refOutsideRanges(seg, v, span.start, [...dataRanges, ...auth])) return true;
+/**
+ * Taint inside one span, with inheritance purity (P-091): pure is
+ * true only when every taint hit in the span is inheritance purity.
+ * A span carrying even one impure hit (a credential shaped read, a
+ * serialization of the whole environment) is an impure flow.
+ */
+function spanHasTaint(text: string, span: TextRange, atoms: Atom[], tainted: Map<string, boolean>, dataRanges: TextRange[], auth: TextRange[] = []): { found: boolean; pure: boolean } {
+  let found = false;
+  let pure = true;
+  for (const a of atoms) {
+    if (!a.inData && a.start >= span.start && a.start < span.end) {
+      found = true;
+      if (a.pure !== true) pure = false;
+    }
   }
-  return false;
+  if (tainted.size > 0) {
+    const seg = text.slice(span.start, span.end);
+    for (const [v, vPure] of tainted) {
+      if (refOutsideRanges(seg, v, span.start, [...dataRanges, ...auth])) {
+        found = true;
+        if (!vPure) pure = false;
+      }
+    }
+  }
+  return { found, pure };
 }
 
 /**
@@ -1051,8 +1166,29 @@ function analyzeExfil(text: string, views: Views, lang: Lang): boolean {
   const dataRanges = views.dataRanges;
   const auth = authRanges(text);
   const atoms = findAtoms(text, dataRanges).filter((a) => !inRanges(a.start, auth));
+  // Inheritance purity (P-091): a bulk atom inside an inheritance
+  // expression passed as a subprocess env= is marked pure. Flows are
+  // accumulated with their purity instead of returning at the first
+  // hit: an impure flow fires ENV-EXFIL unconditionally (the v0.1.4
+  // rule), while a flow whose taint is exclusively inheritance purity
+  // fires only when the flow has a non-loopback destination. The
+  // distilled failure was CloudCorpRecords/xod: a test script builds
+  // ENV = {**os.environ, ...}, passes it as env= to the project's own
+  // server and CLI, and every network call is loopback to the server
+  // it just started; the inherited env tainted the subprocess result
+  // variable, whose print next to the loopback urlopen read as exfil.
+  const inhRanges = inheritanceRanges(text);
+  for (const a of atoms) {
+    if (a.kind === "bulk" && inRanges(a.start, inhRanges)) a.pure = true;
+  }
   const tainted = taintedVars(text, atoms, dataRanges, auth);
-  const has = (span: TextRange): boolean => spanHasTaint(text, span, atoms, tainted, dataRanges, auth);
+  let sawPureFlow = false;
+  let sawImpureFlow = false;
+  const note = (r: { found: boolean; pure: boolean }): void => {
+    if (!r.found) return;
+    if (r.pure) sawPureFlow = true; else sawImpureFlow = true;
+  };
+  const has = (span: TextRange): void => note(spanHasTaint(text, span, atoms, tainted, dataRanges, auth));
 
   const callRes: RegExp[] = [
     /\bfetch\s*\(/g,
@@ -1066,7 +1202,7 @@ function analyzeExfil(text: string, views: Views, lang: Lang): boolean {
   for (const re of callRes) {
     let m: RegExpExecArray | null;
     while ((m = re.exec(text)) !== null) {
-      if (has(callSpan(text, m.index + m[0].length - 1))) return true;
+      has(callSpan(text, m.index + m[0].length - 1));
     }
   }
 
@@ -1080,7 +1216,7 @@ function analyzeExfil(text: string, views: Views, lang: Lang): boolean {
     let isFetchStmt = false;
     for (const p of positions) { if (p >= stmt.start && p < stmt.end) { isFetchStmt = true; break; } }
     if (!isFetchStmt) continue;
-    if (has(stmt)) return true;
+    has(stmt);
   }
 
   for (const stmt of statements) {
@@ -1095,7 +1231,7 @@ function analyzeExfil(text: string, views: Views, lang: Lang): boolean {
       if (!isNc && !isStdinSend) continue;
       for (let e = 0; e < k; e++) {
         const early: TextRange = { start: stmt.start + segments[e].start, end: stmt.start + segments[e].end };
-        if (has(early)) return true;
+        has(early);
       }
     }
   }
@@ -1112,23 +1248,29 @@ function analyzeExfil(text: string, views: Views, lang: Lang): boolean {
   if (hasSendConstruct) {
     for (const m of text.matchAll(/(?:^|[;\n|&]\s*)(?:echo|printf)\s+([^\n;|]*)/g)) {
       const span: TextRange = { start: m.index, end: m.index + m[0].length };
-      if (atoms.some((a) => a.start >= span.start && a.start < span.end)) return true;
+      for (const a of atoms) {
+        if (a.start >= span.start && a.start < span.end) note({ found: true, pure: a.pure === true });
+      }
       const argText = m[1] ?? "";
       const argStart = m.index + m[0].length - argText.length;
-      for (const v of tainted) {
-        if (lang === "shell" || refOutsideRanges(argText, v, argStart, [...dataRanges, ...auth])) return true;
+      for (const [v, vPure] of tainted) {
+        if (lang === "shell" || refOutsideRanges(argText, v, argStart, [...dataRanges, ...auth])) note({ found: true, pure: vPure });
       }
     }
     for (const m of text.matchAll(/\b(?:console\.(?:log|info|debug)|print)\s*\(([^)]*)\)/g)) {
       const span: TextRange = { start: m.index, end: m.index + m[0].length };
-      if (atoms.some((a) => a.start >= span.start && a.start < span.end && (lang === "shell" || !a.inData))) return true;
+      for (const a of atoms) {
+        if (a.start >= span.start && a.start < span.end && (lang === "shell" || !a.inData)) note({ found: true, pure: a.pure === true });
+      }
       const argText = m[1] ?? "";
       const argStart = m.index + m[0].indexOf(argText);
-      for (const v of tainted) {
-        if (lang === "shell" || refOutsideRanges(argText, v, argStart, [...dataRanges, ...auth])) return true;
+      for (const [v, vPure] of tainted) {
+        if (lang === "shell" || refOutsideRanges(argText, v, argStart, [...dataRanges, ...auth])) note({ found: true, pure: vPure });
       }
     }
   }
+  if (sawImpureFlow) return true;
+  if (sawPureFlow) return !loopbackOnlyDestinations(text);
   return false;
 }
 
@@ -1243,7 +1385,12 @@ export function classifyCommand(command: string, lang: Lang = "shell"): { classi
     fired.push({ id: "ENV-ACCESS", evidence: "reads an environment variable whose name is credential shaped (token, secret, password, api key)" });
   }
   if (env.bulk) {
-    fired.push({ id: "ENV-BULK", evidence: "accesses the whole environment at once (serialization, printenv, or env dump)" });
+    fired.push({
+      id: "ENV-BULK",
+      evidence: env.bulkInheritanceOnly
+        ? "accesses the whole environment at once in inheritance or copy form (a spread, dict(), list(), or copy() of the whole environment handed on, for example as a subprocess environment); bulk access, not by itself a serialization or dump"
+        : "accesses the whole environment at once (serialization, printenv, or env dump)",
+    });
   }
   // Exfil is a value flow, not a co-occurrence (P-018): the credential
   // value must reach a send. Token as authentication does not count.
@@ -1512,7 +1659,25 @@ function makeFinding(root: string, file: string, source: HookSource, hook: strin
   return escalateWithLocalFile(root, base, baseAbs);
 }
 
+/**
+ * Stat-type guard (P-069). A file the scanner has decided to read is
+ * checked by stat type BEFORE it is opened, and only regular files are
+ * ever opened. Opening a FIFO (named pipe) blocks until a writer
+ * appears, so a pipe planted at a surface path (.github/workflows/
+ * pipe.yml, a package.json, an .mcp.json) hung the scan forever with
+ * no internal timeout to catch it; sockets and device files are the
+ * same hazard. injectcheck already stats before opening; every read
+ * path in hookcheck now goes through readText or readTextWarn, which
+ * enforce the check centrally, and the per surface scanners that stat
+ * first (Claude settings, husky and githooks files, agent dirs, the
+ * one hop follower) keep their own isFile checks as well.
+ */
+function statIsRegularFile(abs: string): boolean | null {
+  try { return statSync(abs).isFile(); } catch { return null; }
+}
+
 function readText(abs: string): string | null {
+  if (statIsRegularFile(abs) === false) return null;
   try { return readFileSync(abs, "utf8"); } catch { return null; }
 }
 
@@ -1525,6 +1690,10 @@ function readText(abs: string): string | null {
  * presents as a complete all-clear.
  */
 function readTextWarn(abs: string, rel: string, warnings: string[]): string | null {
+  if (statIsRegularFile(abs) === false) {
+    warnings.push(`Non-regular file skipped: ${rel} is not a regular file (FIFO, socket, or device); it was not opened or inventoried`);
+    return null;
+  }
   try { return readFileSync(abs, "utf8"); } catch (err) {
     const code = (err as NodeJS.ErrnoException | undefined)?.code ?? "error";
     warnings.push(`Unreadable file skipped: ${rel} could not be read (${code}); the scan is partial and this file was not inventoried`);
@@ -1608,8 +1777,19 @@ function scanOnePackageJson(root: string, rel: string, findings: HookFinding[], 
  * the directories just below the bound (names only, no file reads) so
  * surfaces sitting there are counted in the warning instead of being
  * silently dropped.
+ *
+ * The bound itself was raised from 4 to 8 in v0.1.9 (P-072): at depth
+ * 4, realistic monorepo nesting (apps/<team>/<app>, packages grouped
+ * by area, fixture trees) sat below the bound, so a package.json
+ * dropper at depth 5 floored at REVIEW via the probe and a depth 8
+ * chain verdicted CLEAN with only the warning. Depth 8 covers those
+ * layouts; the walk cost stays linear in the number of directories
+ * actually present, and the 2,000 file tree and 5 MB workflow perf
+ * spot checks for v0.1.9 showed no material regression against
+ * v0.1.8. Whatever bound remains keeps the warning and the
+ * never-bare-CLEAN rule when the probe detects surface below it.
  */
-export const NESTED_MAX_DEPTH = 4;
+export const NESTED_MAX_DEPTH = 8;
 export const NESTED_MAX_FILES_PER_SURFACE = 200;
 export const PACKAGE_MAX_DEPTH = NESTED_MAX_DEPTH;
 export const PACKAGE_MAX_NESTED = NESTED_MAX_FILES_PER_SURFACE;

