@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3 (2026-10-22)
+
+Pipe truncation fix, found during the v0.1.2 re-validation pass. The CLI called process.exit immediately after console.log; stdout to a pipe is asynchronous in Node, so a large JSON report piped to another process truncated at exactly 65,536 characters while the same report redirected to a file was complete (measured on a sparse cli/cli checkout: 145,508 characters to a file, 65,536 through a pipe, JSON unparseable, on the v0.1.2 binary). The scan and explain paths now set process.exitCode and let the runtime flush stdout in full before exiting; exit codes are unchanged. Regression test in test/round1.test.ts: a 350 step workflow report over 64 KiB piped through the real CLI parses in full with the correct exit code. 106 tests total. No classification or verdict changes from 0.1.2.
+
 ## 0.1.2 (2026-10-22)
 
 Round 1 real-repo validation fixes (validation/problems.md P-002 to P-007, plus the P-015 and P-016 documentation limits). Every fix has a regression test built from the Round 1 evidence in test/round1.test.ts (26 tests, 105 total). Measured with the published 0.1.0 binary on real repos, real package trees (esbuild, puppeteer), and real agent config repos before the fix.

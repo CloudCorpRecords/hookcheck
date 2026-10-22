@@ -6,7 +6,8 @@
  */
 import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { classifyCommand, computeVerdict, scanHooks } from "../src/core.js";
@@ -354,6 +355,37 @@ describe("P-007: Claude settings in nonstandard layouts are discovered", () => {
     });
     const r = scanHooks(dir);
     assert.ok(r.findings.some((f) => f.file === "config/.claude/settings.json"), `files: ${r.findings.map((f) => f.file).join(",")}`);
+  });
+});
+
+describe("pipe truncation: large JSON reports survive a piped stdout (found during v0.1.2 re-validation)", () => {
+  function runCli(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+      const tsx = join(process.cwd(), "node_modules", ".bin", "tsx");
+      if (!existsSync(tsx)) { resolve({ code: -1, stdout: "", stderr: "tsx missing" }); return; }
+      const child = spawn(tsx, [join(process.cwd(), "src", "cli.ts"), ...args], { stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "", stderr = "";
+      child.stdout.on("data", (d) => { stdout += d; });
+      child.stderr.on("data", (d) => { stderr += d; });
+      child.on("error", reject);
+      child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr }));
+      setTimeout(() => { child.kill("SIGKILL"); reject(new Error("cli timeout")); }, 30000);
+    });
+  }
+
+  it("a report over 64 KiB piped through stdout parses in full with the right exit code", async () => {
+    // 350 workflow run steps: the JSON report is well over 64 KiB. In
+    // v0.1.2 as first built, console.log followed by process.exit
+    // truncated piped output at exactly 65,536 characters (measured on a
+    // sparse cli/cli checkout: file redirect 145,508 chars, pipe 65,536).
+    const steps: string[] = ["name: big", "on: push", "jobs:", "  t:", "    runs-on: ubuntu-latest", "    steps:"];
+    for (let i = 0; i < 350; i++) steps.push(`      - run: ./tools/run-step-${i}.sh --with-descriptive-arguments-for-step-${i}`);
+    const dir = fx({ ".github/workflows/big.yml": steps.join("\n") + "\n" });
+    const r = await runCli(["scan", dir, "--json"]);
+    assert.ok(r.stdout.length > 65536, `stdout was only ${r.stdout.length} chars`);
+    const report = JSON.parse(r.stdout) as { counts: { total: number } };
+    assert.equal(report.counts.total, 350);
+    assert.equal(r.code, 1);
   });
 });
 

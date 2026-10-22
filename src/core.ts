@@ -8,7 +8,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 import type { Classification, HookFinding, HookSource, ScanReport, Verdict } from "./types.js";
 
-export const VERSION = "0.1.2";
+export const VERSION = "0.1.3";
 
 interface RuleDef {
   id: string;

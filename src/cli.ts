@@ -45,7 +45,12 @@ async function main(): Promise<void> {
       const report = scanHooks(target);
       if (asJson) console.log(JSON.stringify(report, null, 2));
       else console.log(renderReport(report));
-      process.exit(report.verdict === "CLEAN" ? 0 : 1);
+      // exitCode, not process.exit: stdout to a pipe is async in Node, and
+      // process.exit right after console.log truncates large reports at
+      // exactly 65,536 characters (measured during v0.1.2 re-validation
+      // on a sparse cli/cli checkout). Letting main return lets the
+      // runtime flush stdout in full before exiting with this code.
+      process.exitCode = report.verdict === "CLEAN" ? 0 : 1;
     } else if (cmd === "explain") {
       const args = rest.filter((a) => !a.startsWith("--"));
       const asJson = rest.includes("--json");
@@ -57,13 +62,13 @@ async function main(): Promise<void> {
       const result = explainHook(target, id);
       if (asJson) console.log(JSON.stringify(result, null, 2));
       else console.log(result.explanation);
-      process.exit(result.finding ? 0 : 1);
+      process.exitCode = result.finding ? 0 : 1;
     } else {
       usage();
     }
   } catch (err) {
     console.error(`error: ${err instanceof Error ? err.message : String(err)}`);
-    process.exit(2);
+    process.exitCode = 2;
   }
 }
 
