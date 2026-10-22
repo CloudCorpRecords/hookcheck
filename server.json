@@ -1,1 +1,52 @@
-{"$schema":"https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json","description":"AI persistence hook auditor: scan a repo for auto-exec hooks and flag Shai-Hulud style persistence patterns.","name":"io.github.CloudCorpRecords/hookcheck","packages":[{"identifier":"@reneturcios/hookcheck","packageArguments":[{"type":"positional","value":"mcp"}],"registryBaseUrl":"https://registry.npmjs.org","registryType":"npm","runtimeHint":"npx","transport":{"type":"stdio"},"version":"0.1.0"},{"identifier":"ghcr.io/cloudcorprecords/hookcheck:0.1.0","packageArguments":[{"type":"positional","value":"mcp"}],"registryType":"oci","runtimeArguments":[{"name":"--rm","type":"named"},{"name":"-i","type":"named"}],"runtimeHint":"docker","transport":{"type":"stdio"}}],"repository":{"source":"github","url":"https://github.com/CloudCorpRecords/hookcheck"},"version":"0.1.0"}
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "description": "Persistence hook auditor: scan repos for auto-exec hooks, flag Shai-Hulud patterns.",
+  "name": "io.github.CloudCorpRecords/hookcheck",
+  "packages": [
+    {
+      "identifier": "@reneturcios/hookcheck",
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ],
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "registryType": "npm",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "version": "0.1.0"
+    },
+    {
+      "identifier": "ghcr.io/cloudcorprecords/hookcheck:0.1.0",
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ],
+      "registryType": "oci",
+      "runtimeArguments": [
+        {
+          "name": "--rm",
+          "type": "named"
+        },
+        {
+          "name": "-i",
+          "type": "named"
+        }
+      ],
+      "runtimeHint": "docker",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ],
+  "repository": {
+    "source": "github",
+    "url": "https://github.com/CloudCorpRecords/hookcheck"
+  },
+  "version": "0.1.0"
+}
