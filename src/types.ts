@@ -13,6 +13,7 @@ export type Verdict = "CLEAN" | "REVIEW" | "COMPROMISED-PATTERN";
 export type HookSource =
   | "package.json"
   | "claude-settings"
+  | "claude-plugin"
   | "vscode-tasks"
   | "husky"
   | "lefthook"

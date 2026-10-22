@@ -8,7 +8,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type { Classification, HookFinding, HookSource, ScanReport, Verdict } from "./types.js";
 
-export const VERSION = "0.1.6";
+export const VERSION = "0.1.7";
 
 interface RuleDef {
   id: string;
@@ -33,11 +33,20 @@ export const RISKY_RULES: RuleDef[] = [
   { id: "DECODE-PIPE-SH", pattern: /\bbase64\s+(-d|--decode|-D)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh|node|python3?|perl|ruby)\b/, evidence: "decodes a base64 payload and pipes it straight into an interpreter", severe: true, remote: true },
   { id: "CURL-PIPE-SH", pattern: /\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh|node|python3?|perl|ruby)\b/, evidence: "pipes a network download straight into an interpreter", severe: true, remote: true },
   { id: "REMOTE-EVAL", pattern: /\beval\b[^;]{0,80}\b(curl|wget)\b|\beval\b[^;]{0,80}\$\(\s*(curl|wget)|\bFunction\s*\([^)]{0,80}(curl|wget|fetch)/, evidence: "evaluates content fetched from the network as code", severe: true, remote: true },
-  { id: "NET-FETCH", pattern: /\b(curl|wget)\b|\bfetch\s*\(|https?\s*\.get\s*\(|requests\.(get|post)\b|Invoke-WebRequest\b|Invoke-RestMethod\b/, evidence: "performs a network fetch", remote: true },
+  // NET-FETCH (P-062): the curl and wget alternatives are NOT in this
+  // pattern. A fetch binary counts only in command position (see
+  // fetchPositions below): the token curl naming a package in an install
+  // line (pacman -S curl, apt-get install curl) is a package name being
+  // installed, not a command being run, and matching it anywhere in the
+  // step manufactured a phantom fetch on evilmartians/lefthook.
+  { id: "NET-FETCH", pattern: /\bfetch\s*\(|https?\s*\.get\s*\(|requests\.(get|post)\b|Invoke-WebRequest\b|Invoke-RestMethod\b/, evidence: "performs a network fetch", remote: true },
   { id: "REMOTE-URL", pattern: /https?:\/\/[^\s"'`]+/, evidence: "references a remote URL", remote: true },
   { id: "OBFUSCATION", pattern: /base64\s+(-d|--decode)|atob\s*\(|Buffer\.from\s*\([^)]*base64|\\x[0-9a-fA-F]{2}|\beval\b\s*\(|\beval\b\s+["'$(]|Function\s*\(/, evidence: "uses decoding or dynamic evaluation often used to hide payloads" },
   { id: "WRITE-OUTSIDE", pattern: /(>>?|tee)\s+~\/|(>>?|tee)\s+\$HOME\/|chmod\s+\+x/, evidence: "writes outside the repo or changes executable bits" },
-  { id: "DOWNLOAD-EXEC", pattern: /\bnode\s+-e\b|\bpython3?\s+-c\b|\bdeno\s+eval\b|\bbun\s+-e\b/, evidence: "executes inline code supplied on the command line" },
+  // DOWNLOAD-EXEC is detected procedurally (see detectDownloadExec):
+  // inline code execution counts only when the evaluated content itself
+  // carries a download or remote reference (P-064). A constant
+  // node -e version comparison downloads nothing.
 ];
 
 /**
@@ -144,9 +153,13 @@ function inRanges(idx: number, ranges: TextRange[]): boolean {
  * disclosure next to the prose word "fetch" in a docstring.
  */
 function refOutsideData(seg: string, name: string, segStart: number, dataRanges: TextRange[]): boolean {
+  return refOutsideRanges(seg, name, segStart, dataRanges);
+}
+
+function refOutsideRanges(seg: string, name: string, segStart: number, ranges: TextRange[]): boolean {
   const re = new RegExp(`\\b${name.replace(/\$/g, "\\$")}\\b`, "g");
   for (const m of seg.matchAll(re)) {
-    if (!inRanges(segStart + (m.index ?? 0), dataRanges)) return true;
+    if (!inRanges(segStart + (m.index ?? 0), ranges)) return true;
   }
   return false;
 }
@@ -367,6 +380,118 @@ function firstShellWord(segment: string): string {
 }
 
 /**
+ * Command position for fetch binaries (P-062). The word curl inside a
+ * step is not necessarily a fetch: in `pacman -S --noconfirm openssh
+ * git curl` it is a package name in argument position, and counting it
+ * as NET-FETCH manufactured an exfil verdict on evilmartians/lefthook
+ * (the phantom fetch combined with a credential store write in the same
+ * step). A fetch counts only when curl or wget is the invoked command:
+ * the head of a statement or pipeline segment, after wrappers (sudo,
+ * env, command, xargs, shell keywords) and environment assignments, or
+ * the head of a command string literal (the string handed to
+ * bash -c, execSync, os.system, and friends IS a command). Positions
+ * are returned as indices of the fetch word in the input text.
+ */
+const FETCH_WRAPPERS = new Set(["sudo", "doas", "env", "command", "builtin", "exec", "time", "nice", "nohup", "xargs", "if", "then", "else", "elif", "while", "until", "do", "!"]);
+const WRAPPER_ARG_FLAGS = new Set(["-u", "-I", "-n", "-L", "-P", "-s", "-E", "-e", "-C", "-S"]);
+
+/** Head word of one pipeline segment, with the fetch word offset. */
+function segmentHead(seg: string): { word: string; idx: number } | null {
+  let i = 0;
+  let lastWrapper = "";
+  for (let iter = 0; iter < 16; iter++) {
+    while (i < seg.length && /[\s'"`([{\\]/.test(seg[i])) i++;
+    if ((seg[i] === "$" && seg[i + 1] === "{") || (seg[i] === "$" && seg[i + 1] === "(")) { i += 2; continue; }
+    if (i >= seg.length) return null;
+    const m = seg.slice(i).match(/^[^\s|;&]+/);
+    if (!m) return null;
+    const tok = m[0];
+    if (tok.startsWith("-") && lastWrapper) {
+      // A flag belonging to the wrapper (env -u NAME, xargs -n 1):
+      // skip the flag and, for flags that take a value, its argument.
+      i += tok.length;
+      if (WRAPPER_ARG_FLAGS.has(tok)) {
+        while (i < seg.length && /\s/.test(seg[i])) i++;
+        const arg = seg.slice(i).match(/^[^\s|;&]+/);
+        if (arg) i += arg[0].length;
+      }
+      continue;
+    }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) { i += tok.length; lastWrapper = ""; continue; }
+    const base = (tok.split("/").pop() ?? tok).replace(/['"`)\]]+$/, "");
+    if (FETCH_WRAPPERS.has(base)) { lastWrapper = base; i += tok.length; continue; }
+    const slash = tok.lastIndexOf("/");
+    return { word: base, idx: i + (slash === -1 ? 0 : slash + 1) };
+  }
+  return null;
+}
+
+/** Quoted literal content ranges (simple scanner, escape aware). */
+function quotedContentRanges(text: string): TextRange[] {
+  const ranges: TextRange[] = [];
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    if (c === "'" || c === '"' || c === "`") {
+      let j = i + 1;
+      let depth = 0;
+      while (j < text.length) {
+        if (text[j] === "\\") { j += 2; continue; }
+        if (c === "`" && text[j] === "$" && text[j + 1] === "{") { depth++; j += 2; continue; }
+        if (depth > 0 && text[j] === "}") { depth--; j++; continue; }
+        if (text[j] === c && depth === 0) break;
+        j++;
+      }
+      ranges.push({ start: i + 1, end: j });
+      i = j + 1;
+      continue;
+    }
+    i++;
+  }
+  return ranges;
+}
+
+/**
+ * Indices of curl and wget words in command position in `text`.
+ * Command string literals are searched recursively (depth 2): a literal
+ * is a command string when code hands it to an interpreter, and the
+ * views this runs on have already blanked data literals in script
+ * files and echo arguments in shell text, so a quoted mention of the
+ * word in data does not produce a position.
+ */
+function fetchPositions(text: string, depth = 0): Set<number> {
+  const out = new Set<number>();
+  for (const stmt of splitShell(text, ["\n", ";", "&&", "||"])) {
+    const stmtText = text.slice(stmt.start, stmt.end);
+    for (const seg of splitShell(stmtText, ["|"])) {
+      const segText = stmtText.slice(seg.start, seg.end);
+      const head = segmentHead(segText);
+      if (head && (head.word === "curl" || head.word === "wget")) {
+        out.add(stmt.start + seg.start + head.idx);
+      }
+    }
+  }
+  if (depth < 2) {
+    for (const r of quotedContentRanges(text)) {
+      const inner = text.slice(r.start, r.end);
+      if (!/\b(?:curl|wget)\b/.test(inner)) continue;
+      for (const p of fetchPositions(inner, depth + 1)) out.add(r.start + p);
+    }
+  }
+  return out;
+}
+
+/** True when a CURL-PIPE-SH match in `codeJoined` starts a real fetch. */
+function curlPipeIsCommandFetch(codeJoined: string, positions: Set<number>): boolean {
+  if (positions.size === 0) return false;
+  for (const m of codeJoined.matchAll(/\b(curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh|node|python3?|perl|ruby)\b/g)) {
+    const at = m.index + m[0].indexOf(m[1]);
+    if (positions.has(at)) return true;
+  }
+  return false;
+}
+
+/**
  * Content ranges of echo and printf string arguments in shell text:
  * output data, blanked in the code view, unless the pipeline ends in a
  * bare interpreter (or a bare sh or bash), where the printed text is fed
@@ -417,12 +542,34 @@ interface Views {
   codeText: string;
   credText: string;
   dataRanges: TextRange[];
+  /**
+   * View the REMOTE-URL rule matches on (P-064). For script files this
+   * is the code view with the contents of literals handed to network
+   * calls spliced back: a URL passed to fetch, requests, http.get,
+   * urlopen, axios, or sendBeacon is a fetch target (code position),
+   * while a URL sitting in any other string literal (an error message,
+   * a documentation constant, a docstring) is data and stays blanked.
+   * For shell text, command arguments are code position, so the URL
+   * view is the full text.
+   */
+  urlText: string;
 }
+
+const NETWORK_CALL_RES: RegExp[] = [
+  /\bfetch\s*\(/g,
+  /\baxios(?:\s*\.\s*\w+)?\s*\(/g,
+  /\brequests\s*\.\s*\w+\s*\(/g,
+  /\bhttpx\s*\.\s*\w+\s*\(/g,
+  /\bhttps?\s*\.\s*(?:request|get)\s*\(/g,
+  /\burlopen\s*\(/g,
+  /\bsendBeacon\s*\(/g,
+  /\bWebSocket\s*\(/g,
+];
 
 function buildViews(text: string, lang: Lang): Views {
   if (lang === "shell") {
     const dataRanges = shellEchoDataRanges(text);
-    return { codeText: blankRanges(text, dataRanges), credText: text, dataRanges };
+    return { codeText: blankRanges(text, dataRanges), credText: text, dataRanges, urlText: text };
   }
   const literals = lang === "python" ? scanPyLiterals(text) : scanJsLiterals(text);
   const execSpans = callFirstArgSpans(text, EXEC_CALLS, literals);
@@ -443,7 +590,21 @@ function buildViews(text: string, lang: Lang): Views {
     // "code" literals keep their contents in both views: the text is a
     // program handed to an interpreter, and behavior rules should see it.
   }
-  return { codeText: blankRanges(text, codeBlank), credText: blankRanges(text, credBlank), dataRanges };
+  const codeText = blankRanges(text, codeBlank);
+  // URL view (P-064): restore literal contents handed to network calls.
+  const netSpans: TextRange[] = [];
+  for (const re of NETWORK_CALL_RES) {
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) netSpans.push(callSpan(text, m.index + m[0].length - 1));
+  }
+  const urlChars = codeText.split("");
+  for (const lit of literals) {
+    if (!netSpans.some((s) => lit.contentStart >= s.start && lit.contentEnd <= s.end)) continue;
+    for (const r of contentRanges(lit)) {
+      for (let i = r.start; i < r.end && i < urlChars.length; i++) urlChars[i] = text[i];
+    }
+  }
+  return { codeText, credText: blankRanges(text, credBlank), dataRanges, urlText: urlChars.join("") };
 }
 
 const CRED_FILE_PATTERNS: RegExp[] = [
@@ -608,6 +769,123 @@ function findAtoms(text: string, dataRanges: TextRange[]): Atom[] {
  * Round 2 showed it driving false exfil verdicts on langfuse, PostHog,
  * and cas release automation (P-018).
  */
+/** Consume a balanced bracket span starting at the opener index. */
+function consumeBalanced(text: string, openIdx: number): number {
+  const open = text[openIdx];
+  const close = open === "(" ? ")" : open === "{" ? "}" : open === "[" ? "]" : "";
+  if (!close) return openIdx + 1;
+  let depth = 0;
+  let quote = "";
+  for (let j = openIdx; j < text.length; j++) {
+    const c = text[j];
+    if (quote) {
+      if (c === "\\") { j++; continue; }
+      if (c === quote) quote = "";
+      continue;
+    }
+    if (c === "'" || c === '"' || c === "`") { quote = c; continue; }
+    if (c === open) depth++;
+    else if (c === close) { depth--; if (depth === 0) return j + 1; }
+  }
+  return text.length;
+}
+
+/** Consume one string literal starting at (or just before) index i. */
+function consumeLiteral(text: string, i: number): number {
+  let j = i;
+  while (j < text.length && /[furbFURB]/.test(text[j])) j++;
+  const q = text[j];
+  if (q !== "'" && q !== '"' && q !== "`") return i;
+  const triple = text.startsWith(q + q + q, j);
+  const qLen = triple ? 3 : 1;
+  let k = j + qLen;
+  let depth = 0;
+  while (k < text.length) {
+    if (text[k] === "\\") { k += 2; continue; }
+    if ((q === "`" && text[k] === "$" && text[k + 1] === "{") || (q !== "`" && depth >= 0 && text[k] === "{" && /[fF]/.test(text.slice(Math.max(0, j - 1), j + 1)))) { depth++; k += q === "`" ? 2 : 1; continue; }
+    if (depth > 0 && text[k] === "}") { depth--; k++; continue; }
+    if (depth > 0 && (text[k] === "'" || text[k] === '"' || text[k] === "`")) { k = consumeLiteral(text, k); continue; }
+    if (triple ? text.startsWith(q + q + q, k) : text[k] === q) return k + qLen;
+    if (!triple && text[k] === "\n" && q !== "`") return k;
+    k++;
+  }
+  return k;
+}
+
+/**
+ * Consume a value expression starting at `start`: a string literal
+ * (including template and f-string forms), a bare variable or dotted
+ * chain, a call, a bracketed value, or a +-concatenation of those.
+ * Returns the end index. Capped so a malformed value cannot run away.
+ */
+function consumeValueExpr(text: string, start: number): number {
+  let i = start;
+  const cap = Math.min(text.length, start + 400);
+  for (let part = 0; part < 6; part++) {
+    while (i < cap && /\s/.test(text[i])) i++;
+    if (i >= cap) break;
+    const c = text[i];
+    if (c === "'" || c === '"' || c === "`" || (/[furbFURB]/.test(c) && /["'`]/.test(text[i + 1] ?? ""))) {
+      i = consumeLiteral(text, i);
+    } else if (c === "(" || c === "{" || c === "[") {
+      i = consumeBalanced(text, i);
+    } else if (/[A-Za-z0-9_$]/.test(c)) {
+      while (i < cap && /[A-Za-z0-9_$.]/.test(text[i])) i++;
+      if (text[i] === "[") i = consumeBalanced(text, i);
+      while (i < cap && /\s/.test(text[i])) i++;
+      if (text[i] === "(") i = consumeBalanced(text, i);
+      // A template literal directly after a chain (tag or suffix).
+      while (i < cap && /\s/.test(text[i])) i++;
+      if (text[i] === "`") i = consumeLiteral(text, i);
+    } else {
+      break;
+    }
+    let j = i;
+    while (j < cap && /\s/.test(text[j])) j++;
+    if (text[j] === "+") { i = j + 1; continue; }
+    break;
+  }
+  return i;
+}
+
+const AUTH_HEADER_KEY = /^(authorization|proxy-authorization|api[-_]?key|apikey|x-api-key|x-auth[-_]?token|auth[-_]?token|x-access[-_]?token|access[-_]?token|x-session[-_]?token|session[-_]?token)$/i;
+
+function isAuthHeaderKey(key: string): boolean {
+  const k = key.toLowerCase();
+  return AUTH_HEADER_KEY.test(k) || k.endsWith("-api-key") || k.endsWith("-apikey") || k.endsWith("-auth-token") || k.endsWith("-access-token");
+}
+
+/**
+ * Spans where a credential is used as authentication for the destination
+ * it belongs to: the userinfo of a URL (x-access-token pushes and clones
+ * to the repo's own host), the value of an Authorization header, and the
+ * value of a CLI auth flag (--token, --auth, --api-key). A token in one
+ * of these positions authenticates the send; it is not the payload, and
+ * Round 2 showed it driving false exfil verdicts on langfuse, PostHog,
+ * and cas release automation (P-018).
+ *
+ * Wave B (P-061): the v0.1.4 scrubbing recognized only the literal
+ * Authorization spelling in shell text. Real estates also authenticate
+ * with custom header names (statsig-api-key, x-api-key, any name at
+ * all) and with headers dictionaries inside one hop Python and
+ * TypeScript files, and those shapes still fired ENV-EXFIL on
+ * anthropics/claude-code, hesreallyhim/awesome-claude-code, and
+ * Aider-AI/aider. Authentication positions now also include:
+ *   - any curl -H or --header argument, whatever the header name: the
+ *     whole header value is an authentication position;
+ *   - a dict or object entry whose key is an authentication header
+ *     name (Authorization, *-api-key, *-auth-token, and friends),
+ *     whatever the surrounding code;
+ *   - any header-shaped entry (a header name key) inside a headers
+ *     construction: a dict assigned to a variable named like headers,
+ *     a headers= keyword argument, or a headers property of a fetch
+ *     or request options object;
+ *   - header setter calls (set, append, setHeader) and Python
+ *     requests-style auth= tuples.
+ * A credential that reaches a payload position (body, query, URL path,
+ * printed output next to a send) still fires: only the value
+ * expressions of these header positions are scrubbed.
+ */
 function authRanges(text: string): TextRange[] {
   const ranges: TextRange[] = [];
   for (const m of text.matchAll(/https?:\/\/[^\s"'`]+/g)) {
@@ -628,11 +906,61 @@ function authRanges(text: string): TextRange[] {
   for (const m of text.matchAll(/--(?:token|auth|api[-_]?key|password|secret)(?:\s*=\s*|\s+)["']?/gi)) {
     ranges.push(valueAfter(m.index + m[0].length));
   }
+  // curl -H and --header arguments: any header name is authentication.
+  for (const m of text.matchAll(/(?:^|[\s;|&])(?:-H|--header)(?:\s+|=)/g)) {
+    let i = m.index + m[0].length;
+    while (i < text.length && /\s/.test(text[i])) i++;
+    if (i >= text.length) continue;
+    if (text[i] === "'" || text[i] === '"' || text[i] === "`") {
+      const end = consumeLiteral(text, i);
+      ranges.push({ start: i + 1, end: Math.max(i + 1, end - 1) });
+    } else {
+      ranges.push(valueAfter(i));
+    }
+  }
+  // Header setter calls and requests-style auth= tuples.
+  for (const m of text.matchAll(/\b(?:set|append|setHeader|addHeader|header)\s*\(\s*["'][A-Za-z0-9-]+["']\s*,\s*/g)) {
+    const end = consumeValueExpr(text, m.index + m[0].length);
+    if (end > m.index + m[0].length) ranges.push({ start: m.index + m[0].length, end });
+  }
+  for (const m of text.matchAll(/\bauth\s*=\s*\(/g)) {
+    ranges.push({ start: m.index, end: consumeBalanced(text, m.index + m[0].length - 1) });
+  }
+  // Dict and object entries: authentication header keys anywhere, and
+  // any header-shaped key inside a headers construction.
+  const entryRe = /(?:^|[{,;\n])\s*(?:(["'])([A-Za-z][A-Za-z0-9_-]*)\1|([A-Za-z][A-Za-z0-9_-]*))\s*:\s*/g;
+  let em: RegExpExecArray | null;
+  while ((em = entryRe.exec(text)) !== null) {
+    const key = em[2] ?? em[3] ?? "";
+    if (!key) continue;
+    const valueStart = em.index + em[0].length;
+    let auth = isAuthHeaderKey(key);
+    if (!auth) {
+      // Headers construction context: the nearest opening brace before
+      // this entry is introduced by a headers assignment, property, or
+      // keyword argument.
+      const brace = text.lastIndexOf("{", em.index);
+      if (brace !== -1 && em.index - brace < 2000) {
+        const before = text.slice(Math.max(0, brace - 90), brace);
+        auth = /(?:^|[\s{,;])(?:[A-Za-z_$][A-Za-z0-9_$]*headers[A-Za-z0-9_$]*|headers)\s*[:=]\s*$/i.test(before)
+          || /[A-Za-z_$][A-Za-z0-9_$]*[Hh]eaders[A-Za-z0-9_$]*\s*=\s*$/.test(before);
+      }
+    }
+    if (!auth) continue;
+    const end = consumeValueExpr(text, valueStart);
+    if (end > valueStart) ranges.push({ start: valueStart, end });
+  }
   return ranges;
 }
 
-/** Variables assigned (transitively) from a credential value expression. */
-function taintedVars(text: string, atoms: Atom[], dataRanges: TextRange[]): Set<string> {
+/**
+ * Variables assigned (transitively) from a credential value expression.
+ * References inside authentication positions do not propagate taint
+ * (P-061): a headers dict whose only credential use is its
+ * Authorization value is an authentication container, not a tainted
+ * payload, and passing it to fetch does not become exfil.
+ */
+function taintedVars(text: string, atoms: Atom[], dataRanges: TextRange[], auth: TextRange[] = []): Set<string> {
   const tainted = new Set<string>();
   const assignRe = /(?:^|[;\n,])\s*(?:export\s+|const\s+|let\s+|var\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*=(?![=<>])\s*/g;
   const assigns: Array<{ name: string; rhsStart: number; rhsEnd: number }> = [];
@@ -650,7 +978,7 @@ function taintedVars(text: string, atoms: Atom[], dataRanges: TextRange[]): Set<
       if (live.some((x) => x.start >= a.rhsStart && x.start < a.rhsEnd)) { tainted.add(a.name); continue; }
       const rhs = text.slice(a.rhsStart, a.rhsEnd);
       for (const v of tainted) {
-        if (refOutsideData(rhs, v, a.rhsStart, dataRanges)) { tainted.add(a.name); break; }
+        if (refOutsideRanges(rhs, v, a.rhsStart, [...dataRanges, ...auth])) { tainted.add(a.name); break; }
       }
     }
   }
@@ -675,12 +1003,12 @@ function callSpan(text: string, openIdx: number): TextRange {
   return { start: openIdx, end: text.length };
 }
 
-function spanHasTaint(text: string, span: TextRange, atoms: Atom[], tainted: Set<string>, dataRanges: TextRange[]): boolean {
+function spanHasTaint(text: string, span: TextRange, atoms: Atom[], tainted: Set<string>, dataRanges: TextRange[], auth: TextRange[] = []): boolean {
   if (atoms.some((a) => !a.inData && a.start >= span.start && a.start < span.end)) return true;
   if (tainted.size === 0) return false;
   const seg = text.slice(span.start, span.end);
   for (const v of tainted) {
-    if (refOutsideData(seg, v, span.start, dataRanges)) return true;
+    if (refOutsideRanges(seg, v, span.start, [...dataRanges, ...auth])) return true;
   }
   return false;
 }
@@ -711,8 +1039,8 @@ function analyzeExfil(text: string, views: Views, lang: Lang): boolean {
   const dataRanges = views.dataRanges;
   const auth = authRanges(text);
   const atoms = findAtoms(text, dataRanges).filter((a) => !inRanges(a.start, auth));
-  const tainted = taintedVars(text, atoms, dataRanges);
-  const has = (span: TextRange): boolean => spanHasTaint(text, span, atoms, tainted, dataRanges);
+  const tainted = taintedVars(text, atoms, dataRanges, auth);
+  const has = (span: TextRange): boolean => spanHasTaint(text, span, atoms, tainted, dataRanges, auth);
 
   const callRes: RegExp[] = [
     /\bfetch\s*\(/g,
@@ -730,9 +1058,16 @@ function analyzeExfil(text: string, views: Views, lang: Lang): boolean {
     }
   }
 
+  // Fetch positions run on the code view with data blanked (indices
+  // align with `text`: every view transform preserves length). A curl
+  // word in argument position (P-062) opens no exfil path.
+  const positionText = blankRanges(views.codeText, dataRanges);
+  const positions = fetchPositions(positionText);
   const statements = splitShell(text, ["\n", ";", "&&", "||"]);
   for (const stmt of statements) {
-    if (!/\b(?:curl|wget)\b/.test(text.slice(stmt.start, stmt.end))) continue;
+    let isFetchStmt = false;
+    for (const p of positions) { if (p >= stmt.start && p < stmt.end) { isFetchStmt = true; break; } }
+    if (!isFetchStmt) continue;
     if (has(stmt)) return true;
   }
 
@@ -760,8 +1095,8 @@ function analyzeExfil(text: string, views: Views, lang: Lang): boolean {
   // a code position (an f-string or template interpolation hole is code;
   // prose inside a plain string is not). In shell text, echo and printf
   // arguments ARE the printed values, so references inside them count.
-  const gateText = blankRanges(views.codeText, dataRanges);
-  const hasSendConstruct = /\b(?:fetch|axios|requests\s*\.|urlopen|https?\s*\.\s*(?:request|get)|curl|wget|nc|netcat)\b/.test(gateText);
+  const gateText = positionText;
+  const hasSendConstruct = /\b(?:fetch|axios|requests\s*\.|urlopen|https?\s*\.\s*(?:request|get)|nc|netcat)\b/.test(gateText) || positions.size > 0;
   if (hasSendConstruct) {
     for (const m of text.matchAll(/(?:^|[;\n|&]\s*)(?:echo|printf)\s+([^\n;|]*)/g)) {
       const span: TextRange = { start: m.index, end: m.index + m[0].length };
@@ -769,7 +1104,7 @@ function analyzeExfil(text: string, views: Views, lang: Lang): boolean {
       const argText = m[1] ?? "";
       const argStart = m.index + m[0].length - argText.length;
       for (const v of tainted) {
-        if (lang === "shell" || refOutsideData(argText, v, argStart, dataRanges)) return true;
+        if (lang === "shell" || refOutsideRanges(argText, v, argStart, [...dataRanges, ...auth])) return true;
       }
     }
     for (const m of text.matchAll(/\b(?:console\.(?:log|info|debug)|print)\s*\(([^)]*)\)/g)) {
@@ -778,7 +1113,7 @@ function analyzeExfil(text: string, views: Views, lang: Lang): boolean {
       const argText = m[1] ?? "";
       const argStart = m.index + m[0].indexOf(argText);
       for (const v of tainted) {
-        if (lang === "shell" || refOutsideData(argText, v, argStart, dataRanges)) return true;
+        if (lang === "shell" || refOutsideRanges(argText, v, argStart, [...dataRanges, ...auth])) return true;
       }
     }
   }
@@ -800,6 +1135,36 @@ const SAFE_PATTERNS: RegExp[] = [
   /^simple-git-hooks$/i,
 ];
 
+/**
+ * DOWNLOAD-EXEC (P-064). Inline code execution (node -e, python -c,
+ * deno eval, bun -e) is download-exec only when the evaluated content
+ * itself carries a download or remote reference: a URL, a fetch or
+ * request call, a network module. Constant inline code (a node -e
+ * version comparison in modelcontextprotocol/servers, uv run python -c
+ * file parsers in wshobson/agents) downloads nothing and is not
+ * download-exec; labeling it RISKY was pure noise.
+ */
+function detectDownloadExec(codeText: string): boolean {
+  const re = /\b(?:node|bun)\s+-(?:e|-eval)\b|\bdeno\s+eval\b|\bpython3?\s+-c\b/g;
+  const netRef = /https?:\/\/|\bfetch\s*\(|\bcurl\b|\bwget\b|\brequests\b|urllib|urlopen|\baxios\b|https?\s*\.\s*(?:get|request)|XMLHttpRequest|\bnet\s*\.\s*connect|\bsocket\b/i;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(codeText)) !== null) {
+    let i = m.index + m[0].length;
+    while (i < codeText.length && /\s/.test(codeText[i])) i++;
+    let content = "";
+    if (codeText[i] === "'" || codeText[i] === '"' || codeText[i] === "`") {
+      const end = consumeLiteral(codeText, i);
+      content = codeText.slice(i, end);
+    } else {
+      let j = i;
+      while (j < codeText.length && codeText[j] !== "\n" && codeText[j] !== ";" && codeText[j] !== "|") j++;
+      content = codeText.slice(i, j);
+    }
+    if (netRef.test(content)) return true;
+  }
+  return false;
+}
+
 export function classifyCommand(command: string, lang: Lang = "shell"): { classification: Classification; rules: string[]; evidence: string } {
   // Strip comments first (a docs URL in a comment is not a fetch), then
   // normalize shell line continuations and stray carriage returns, so a
@@ -818,10 +1183,30 @@ export function classifyCommand(command: string, lang: Lang = "shell"): { classi
   const views = buildViews(cmd, lang);
   const joined = cmd.replace(/\n/g, " ");
   const codeJoined = views.codeText.replace(/\n/g, " ");
+  const urlJoined = views.urlText.replace(/\n/g, " ");
+  // Fetch positions are computed on the newline preserving code view:
+  // newlines are statement separators, and flattening them first would
+  // glue an install line and the curl command after it into one
+  // statement whose head is the package manager. Indices align with
+  // the joined views because joining only swaps newline for space.
+  const positions = fetchPositions(views.codeText);
   const fired: Array<{ id: string; evidence: string }> = [];
   for (const rule of RISKY_RULES) {
-    const hay = rule.id === "REMOTE-URL" ? joined : codeJoined;
+    if (rule.id === "NET-FETCH") {
+      // P-062: the pattern covers the non-curl fetch forms; curl and
+      // wget count only in command position.
+      if (rule.pattern.test(codeJoined) || positions.size > 0) fired.push({ id: rule.id, evidence: rule.evidence });
+      continue;
+    }
+    if (rule.id === "CURL-PIPE-SH") {
+      if (curlPipeIsCommandFetch(codeJoined, positions)) fired.push({ id: rule.id, evidence: rule.evidence });
+      continue;
+    }
+    const hay = rule.id === "REMOTE-URL" ? urlJoined : codeJoined;
     if (rule.pattern.test(hay)) fired.push({ id: rule.id, evidence: rule.evidence });
+  }
+  if (detectDownloadExec(views.codeText)) {
+    fired.push({ id: "DOWNLOAD-EXEC", evidence: "executes inline code that itself downloads or references remote content" });
   }
   // Loopback downgrade (P-004): a fetch whose every URL is loopback is a
   // local health check shape, not a network exfil shape. Downgrade only
@@ -1044,6 +1429,45 @@ function escalateWithScriptChain(root: string, scripts: Record<string, unknown>,
  * read, a download by itself) classify RISKY at most, and a RISKY-only
  * estate verdicts REVIEW, never COMPROMISED-PATTERN.
  */
+/**
+ * Vendor installer pipe calibration (P-063, Wave B). A CI workflow step
+ * whose ONLY severe evidence is a curl pipe to a named vendor's
+ * official installer over HTTPS (the uv installer at astral.sh, the
+ * opencode installer) is the same family as the esbuild and puppeteer
+ * download-own-binary installers the v0.1.2 calibration already holds
+ * at REVIEW: the pattern match is literal and the finding stays RISKY,
+ * but nothing about the step exfils, persists, or touches a credential.
+ * The narrowing is deliberately tight; ALL of these must hold:
+ *   - the finding is a GitHub workflow run step (CI context). The same
+ *     pipe on an auto-exec hook surface (package.json script, Claude
+ *     settings or plugin hook, folderOpen task) keeps the top verdict:
+ *     a hook runs on a developer machine at open or install time,
+ *     which is exactly the Shai-Hulud persistence shape;
+ *   - CURL-PIPE-SH is the only severe rule, and every rule present is
+ *     part of the pipe shape itself (CURL-PIPE-SH, NET-FETCH,
+ *     REMOTE-URL). Any credential rule, persistence rule, or second
+ *     severe signal disqualifies the finding;
+ *   - the piped URL is HTTPS and installer shaped: a path segment
+ *     named install, installer, or setup (optionally with a script
+ *     extension), or a host on the short known-installer list below.
+ * A curl pipe to an unversioned or non-vendor source (payload.sh on an
+ * arbitrary host) never qualifies.
+ */
+const KNOWN_INSTALLER_HOSTS = new Set(["sh.rustup.rs", "get.docker.com", "install.python-poetry.org", "astral.sh", "opencode.ai"]);
+
+function isVendorInstallerPipeOnly(f: HookFinding): boolean {
+  if (f.source !== "github-workflow") return false;
+  if (!f.rules.includes("CURL-PIPE-SH")) return false;
+  const allowed = new Set(["CURL-PIPE-SH", "NET-FETCH", "REMOTE-URL"]);
+  if (!f.rules.every((r) => allowed.has(r))) return false;
+  const m = f.command.match(/https:\/\/([^\s"'`/:?#]+)([^\s"'`]*)/i);
+  if (!m) return false;
+  const host = m[1].toLowerCase();
+  const path = (m[2] ?? "").toLowerCase();
+  if (/(^|\/)(install|installer|setup)(\.(sh|bash|ps1|py))?($|[/?#])/.test(path)) return true;
+  return KNOWN_INSTALLER_HOSTS.has(host);
+}
+
 export function computeVerdict(findings: HookFinding[]): Verdict {
   let review = false;
   for (const f of findings) {
@@ -1052,7 +1476,10 @@ export function computeVerdict(findings: HookFinding[]): Verdict {
       const hasSevere = metas.some((x) => x.severe);
       const hasCredStore = f.rules.includes("CRED-ACCESS");
       const hasNet = metas.some((x) => x.remote);
-      if (hasSevere || (hasCredStore && hasNet)) return "COMPROMISED-PATTERN";
+      // P-063: a lone vendor installer pipe in CI is strong pattern
+      // evidence but not, on its own, a compromise pattern.
+      const vendorPipeOnly = isVendorInstallerPipeOnly(f);
+      if ((hasSevere && !vendorPipeOnly) || (hasCredStore && hasNet)) return "COMPROMISED-PATTERN";
       review = true;
     } else if (f.classification === "UNKNOWN") {
       review = true;
@@ -1198,18 +1625,18 @@ function scanPackageJson(root: string, findings: HookFinding[], warnings: string
   }
 }
 
-function collectClaudeHooks(node: unknown, file: string, root: string, findings: HookFinding[], prefix: string): void {
+function collectClaudeHooks(node: unknown, file: string, root: string, findings: HookFinding[], prefix: string, source: HookSource = "claude-settings", baseAbs: string = root): void {
   if (!node || typeof node !== "object") return;
   const obj = node as Record<string, unknown>;
   if (typeof obj.command === "string" && obj.command.trim()) {
-    findings.push(makeFinding(root, file, "claude-settings", prefix || "hook", obj.command, String(findings.length)));
+    findings.push(makeFinding(root, file, source, prefix || "hook", obj.command, String(findings.length), undefined, baseAbs));
     return;
   }
   for (const [key, value] of Object.entries(obj)) {
     if (Array.isArray(value)) {
-      value.forEach((item, i) => collectClaudeHooks(item, file, root, findings, prefix ? `${prefix}:${key}` : key));
+      value.forEach((item, i) => collectClaudeHooks(item, file, root, findings, prefix ? `${prefix}:${key}` : key, source, baseAbs));
     } else if (value && typeof value === "object") {
-      collectClaudeHooks(value, file, root, findings, prefix ? `${prefix}:${key}` : key);
+      collectClaudeHooks(value, file, root, findings, prefix ? `${prefix}:${key}` : key, source, baseAbs);
     }
   }
 }
@@ -1258,6 +1685,88 @@ function scanClaude(root: string, findings: HookFinding[], warnings: string[]): 
       continue;
     }
     collectClaudeHooks(hooks, rel, root, findings, "");
+  }
+}
+
+/**
+ * Claude Code plugin hook files (P-060, BLOCKER). Plugins distribute
+ * hooks in a hooks/ directory at the plugin root: hooks/hooks.json at
+ * the repo root for a single plugin repo (obra/superpowers), or
+ * plugins/<name>/hooks/hooks.json inside a marketplace or monorepo
+ * (anthropics/claude-code carries 9 such files, wshobson/agents 2 among
+ * 92 plugin directories). Before v0.1.7 none of these files was scanned
+ * at any depth: a SessionStart curl pipe in hooks/hooks.json scanned
+ * CLEAN with total 0 while the identical payload in .claude/settings.json
+ * verdicts COMPROMISED-PATTERN. The file carries the same schema as the
+ * hooks key of .claude/settings.json (an events map of command hooks:
+ * SessionStart, PreToolUse, PostToolUse, Stop, UserPromptSubmit, and
+ * the rest of the Claude Code event set), so commands are classified
+ * exactly as settings hooks are. The sibling hooks/hooks-cursor.json
+ * variant shipped by the same plugins (superpowers) carries the same
+ * command object shape under Cursor event names, so it is inventoried
+ * the same way.
+ *
+ * The walk mirrors the nested package.json discipline (P-032): sorted
+ * order, node_modules, .git, and dot directories never entered,
+ * symlinked directories never followed, and a cap with a warning. The
+ * depth bound applies to the plugin root (at most PLUGIN_HOOKS_MAX_DEPTH
+ * directories below the scan root); the hooks directory itself sits one
+ * level below its plugin root.
+ */
+export const PLUGIN_HOOKS_MAX_DEPTH = 4;
+export const PLUGIN_HOOKS_MAX_FILES = 200;
+
+function discoverPluginHookFiles(root: string, warnings: string[]): string[] {
+  const found: string[] = [];
+  const skipDirs = new Set(["node_modules", ".git"]);
+  const maxHooksDirDepth = PLUGIN_HOOKS_MAX_DEPTH + 1;
+  const stack: Array<{ abs: string; rel: string; depth: number }> = [{ abs: root, rel: "", depth: 0 }];
+  while (stack.length > 0) {
+    const cur = stack.pop() as { abs: string; rel: string; depth: number };
+    let entries: string[] = [];
+    try { entries = readdirSync(cur.abs); } catch {
+      if (cur.rel) warnings.push(`Unreadable directory skipped: ${cur.rel} could not be listed; the scan is partial`);
+      continue;
+    }
+    entries.sort();
+    const base = cur.rel === "" ? "" : (cur.rel.split("/").pop() ?? "");
+    if (cur.depth >= 1 && base === "hooks") {
+      for (const name of ["hooks.json", "hooks-cursor.json"]) {
+        if (entries.includes(name)) found.push(cur.rel === "" ? name : `${cur.rel}/${name}`);
+      }
+    }
+    if (cur.depth >= maxHooksDirDepth) continue;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const name = entries[i];
+      if (skipDirs.has(name) || name.startsWith(".")) continue;
+      const childAbs = join(cur.abs, name);
+      let lst; try { lst = lstatSync(childAbs); } catch { continue; }
+      if (lst.isSymbolicLink() || !lst.isDirectory()) continue;
+      stack.push({ abs: childAbs, rel: cur.rel === "" ? name : `${cur.rel}/${name}`, depth: cur.depth + 1 });
+    }
+  }
+  found.sort();
+  if (found.length > PLUGIN_HOOKS_MAX_FILES) {
+    warnings.push(`Plugin hooks inventory capped at ${PLUGIN_HOOKS_MAX_FILES} files (${found.length} found); the remaining plugin hook files were not inventoried and the scan is partial`);
+    return found.slice(0, PLUGIN_HOOKS_MAX_FILES);
+  }
+  return found;
+}
+
+function scanPluginHooks(root: string, findings: HookFinding[], warnings: string[]): void {
+  for (const rel of discoverPluginHookFiles(root, warnings)) {
+    const data = readJson(root, rel, warnings) as Record<string, unknown> | null;
+    if (!data || typeof data !== "object" || Array.isArray(data)) continue;
+    // The events map lives under the hooks key when one is present;
+    // some plugin files put the events map at the top level.
+    const eventsNode = ("hooks" in data && data.hooks && typeof data.hooks === "object" && !Array.isArray(data.hooks))
+      ? data.hooks
+      : data;
+    // Referenced local files resolve against the plugin root (the
+    // directory holding the hooks folder), which is where
+    // ${CLAUDE_PLUGIN_ROOT} points at runtime.
+    const pluginRootAbs = dirname(dirname(join(root, rel)));
+    collectClaudeHooks(eventsNode, rel, root, findings, "", "claude-plugin", pluginRootAbs);
   }
 }
 
@@ -1620,6 +2129,7 @@ export function scanHooks(root: string): ScanReport {
   }
   scanPackageJson(root, findings, warnings);
   scanClaude(root, findings, warnings);
+  scanPluginHooks(root, findings, warnings);
   scanVscode(root, findings, warnings);
   scanDirFiles(root, ".husky", "husky", findings, warnings);
   scanLefthook(root, findings, warnings);
