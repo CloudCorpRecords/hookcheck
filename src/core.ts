@@ -477,6 +477,18 @@ function fetchPositions(text: string, depth = 0): Set<number> {
       if (!/\b(?:curl|wget)\b/.test(inner)) continue;
       for (const p of fetchPositions(inner, depth + 1)) out.add(r.start + p);
     }
+    // Interpreter -c and -e tails are command strings too, even when
+    // the quotes are not visible in the text under analysis: an MCP
+    // config's command and args are joined with spaces, so a server
+    // configured as sh with args [-c, "curl ... | sh"] reaches the
+    // classifier as the unquoted text `sh -c curl ... | sh`, whose
+    // pipeline head is sh. The tail after the -c flag is the program.
+    for (const m of text.matchAll(/\b(?:sh|bash|zsh|dash)\s+-c\s+|\b(?:node|bun|python3?|perl|ruby)\s+-(?:e|c)\s+/g)) {
+      const start = m.index + m[0].length;
+      const tail = text.slice(start);
+      if (!/\b(?:curl|wget)\b/.test(tail)) continue;
+      for (const p of fetchPositions(tail, depth + 1)) out.add(start + p);
+    }
   }
   return out;
 }
