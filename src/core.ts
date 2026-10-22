@@ -8,7 +8,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type { Classification, HookFinding, HookSource, ScanReport, Verdict } from "./types.js";
 
-export const VERSION = "0.1.12";
+export const VERSION = "0.1.13";
 
 interface RuleDef {
   id: string;
@@ -849,6 +849,47 @@ const NETWORK_CALL_RES: RegExp[] = [
   /\bWebSocket\s*\(/g,
 ];
 
+/**
+ * Echo and printf output ranges for the credential view (P-108
+ * follow-on, v0.1.13): the quoted output text with command
+ * substitution interiors carved back out. A printed message that
+ * NAMES a credential file (the github/docs lint error "Could not
+ * scan .npmrc and package-lock.json for package feed URLs") is a
+ * reference, not credential access, the same doctrine as a search
+ * target and as a data literal in a script file, whose contents the
+ * credential view already blanks. A substitution inside the message
+ * ($(cat ~/.npmrc), or the backtick form) is code that runs when
+ * the message prints, so its interior stays visible and still
+ * fires. When the pipeline ends in a bare interpreter the echo
+ * ranges are empty by construction (the printed text is the
+ * program) and nothing is blanked here either.
+ */
+function echoCredRanges(text: string, echoRanges: TextRange[]): TextRange[] {
+  const out: TextRange[] = [];
+  for (const r of echoRanges) {
+    let cur = r.start;
+    let i = r.start;
+    while (i < r.end) {
+      const isSub = text[i] === "$" && text[i + 1] === "(";
+      const isTick = text[i] === "`";
+      if (!isSub && !isTick) { i++; continue; }
+      let subEnd: number;
+      if (isSub) {
+        subEnd = consumeBalanced(text, i + 1);
+      } else {
+        let k = i + 1;
+        while (k < r.end && text[k] !== "`") { if (text[k] === "\\") k++; k++; }
+        subEnd = Math.min(k + 1, r.end);
+      }
+      if (i > cur) out.push({ start: cur, end: i });
+      cur = Math.max(cur, Math.min(subEnd, r.end));
+      i = cur;
+    }
+    if (r.end > cur) out.push({ start: cur, end: r.end });
+  }
+  return out;
+}
+
 function buildViews(text: string, lang: Lang): Views {
   if (lang === "shell") {
     const echoRanges = shellEchoDataRanges(text);
@@ -856,11 +897,14 @@ function buildViews(text: string, lang: Lang): Views {
     // the behavior and URL views, and pattern plus search input
     // operands are blanked in the credential view, so a defensive
     // grep supplies neither half of a strong evidence combination.
+    // Output text is data for the credential view too (P-108
+    // follow-on): echo and printf argument text is blanked there,
+    // minus command substitution interiors, which are code.
     const search = searchRanges(text);
     const dataRanges = [...echoRanges, ...search.pattern];
     return {
       codeText: blankRanges(text, dataRanges),
-      credText: blankRanges(text, [...search.pattern, ...search.operands]),
+      credText: blankRanges(text, [...search.pattern, ...search.operands, ...echoCredRanges(text, echoRanges)]),
       dataRanges,
       urlText: blankRanges(text, search.pattern),
     };
