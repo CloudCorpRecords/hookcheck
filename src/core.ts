@@ -8,7 +8,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 import type { Classification, HookFinding, HookSource, ScanReport, Verdict } from "./types.js";
 
-export const VERSION = "0.1.4";
+export const VERSION = "0.1.5";
 
 interface RuleDef {
   id: string;
@@ -130,6 +130,25 @@ interface LiteralSpan extends TextRange {
 
 function inRanges(idx: number, ranges: TextRange[]): boolean {
   return ranges.some((r) => idx >= r.start && idx < r.end);
+}
+
+/**
+ * True when `name` is referenced at a code position inside `seg` (whose
+ * global start offset is `segStart`): at least one occurrence that does
+ * not begin inside a data literal. A variable merely NAMED in prose (help
+ * text, a banner string, a docstring) is mentioned, not used; the mention
+ * must not propagate taint or count as disclosure. Found in the v0.1.4
+ * re-validation on jpoley/flowspec: a kwarg default tainted the variable
+ * name `help` through its prose value ("GitHub token for API requests"),
+ * and a banner printing the word --help then read as credential
+ * disclosure next to the prose word "fetch" in a docstring.
+ */
+function refOutsideData(seg: string, name: string, segStart: number, dataRanges: TextRange[]): boolean {
+  const re = new RegExp(`\\b${name.replace(/\$/g, "\\$")}\\b`, "g");
+  for (const m of seg.matchAll(re)) {
+    if (!inRanges(segStart + (m.index ?? 0), dataRanges)) return true;
+  }
+  return false;
 }
 
 function blankRanges(text: string, ranges: TextRange[]): string {
@@ -613,7 +632,7 @@ function authRanges(text: string): TextRange[] {
 }
 
 /** Variables assigned (transitively) from a credential value expression. */
-function taintedVars(text: string, atoms: Atom[]): Set<string> {
+function taintedVars(text: string, atoms: Atom[], dataRanges: TextRange[]): Set<string> {
   const tainted = new Set<string>();
   const assignRe = /(?:^|[;\n,])\s*(?:export\s+|const\s+|let\s+|var\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*=(?![=<>])\s*/g;
   const assigns: Array<{ name: string; rhsStart: number; rhsEnd: number }> = [];
@@ -631,7 +650,7 @@ function taintedVars(text: string, atoms: Atom[]): Set<string> {
       if (live.some((x) => x.start >= a.rhsStart && x.start < a.rhsEnd)) { tainted.add(a.name); continue; }
       const rhs = text.slice(a.rhsStart, a.rhsEnd);
       for (const v of tainted) {
-        if (new RegExp(`\\b${v.replace(/\$/g, "\\$")}\\b`).test(rhs)) { tainted.add(a.name); break; }
+        if (refOutsideData(rhs, v, a.rhsStart, dataRanges)) { tainted.add(a.name); break; }
       }
     }
   }
@@ -656,12 +675,12 @@ function callSpan(text: string, openIdx: number): TextRange {
   return { start: openIdx, end: text.length };
 }
 
-function spanHasTaint(text: string, span: TextRange, atoms: Atom[], tainted: Set<string>): boolean {
+function spanHasTaint(text: string, span: TextRange, atoms: Atom[], tainted: Set<string>, dataRanges: TextRange[]): boolean {
   if (atoms.some((a) => !a.inData && a.start >= span.start && a.start < span.end)) return true;
   if (tainted.size === 0) return false;
   const seg = text.slice(span.start, span.end);
   for (const v of tainted) {
-    if (new RegExp(`\\b${v.replace(/\$/g, "\\$")}\\b`).test(seg)) return true;
+    if (refOutsideData(seg, v, span.start, dataRanges)) return true;
   }
   return false;
 }
@@ -688,11 +707,12 @@ function spanHasTaint(text: string, span: TextRange, atoms: Atom[], tainted: Set
  *   - a credential value printed or logged while a send construct is
  *     present in the same text (CI logs are a real leak channel).
  */
-function analyzeExfil(text: string, dataRanges: TextRange[]): boolean {
+function analyzeExfil(text: string, views: Views, lang: Lang): boolean {
+  const dataRanges = views.dataRanges;
   const auth = authRanges(text);
   const atoms = findAtoms(text, dataRanges).filter((a) => !inRanges(a.start, auth));
-  const tainted = taintedVars(text, atoms);
-  const has = (span: TextRange): boolean => spanHasTaint(text, span, atoms, tainted);
+  const tainted = taintedVars(text, atoms, dataRanges);
+  const has = (span: TextRange): boolean => spanHasTaint(text, span, atoms, tainted, dataRanges);
 
   const callRes: RegExp[] = [
     /\bfetch\s*\(/g,
@@ -733,23 +753,32 @@ function analyzeExfil(text: string, dataRanges: TextRange[]): boolean {
     }
   }
 
-  // Print disclosure alongside a send construct in the same text.
-  const hasSendConstruct = /\b(?:fetch|axios|requests\s*\.|urlopen|https?\s*\.\s*(?:request|get)|curl|wget|nc|netcat)\b/.test(text);
+  // Print disclosure alongside a send construct in the same text. The
+  // send gate runs on the code view with data blanked: a send WORD in
+  // prose (a docstring saying "we fetch release metadata") is not a send
+  // construct. In script files a printed atom or variable only counts at
+  // a code position (an f-string or template interpolation hole is code;
+  // prose inside a plain string is not). In shell text, echo and printf
+  // arguments ARE the printed values, so references inside them count.
+  const gateText = blankRanges(views.codeText, dataRanges);
+  const hasSendConstruct = /\b(?:fetch|axios|requests\s*\.|urlopen|https?\s*\.\s*(?:request|get)|curl|wget|nc|netcat)\b/.test(gateText);
   if (hasSendConstruct) {
     for (const m of text.matchAll(/(?:^|[;\n|&]\s*)(?:echo|printf)\s+([^\n;|]*)/g)) {
       const span: TextRange = { start: m.index, end: m.index + m[0].length };
       if (atoms.some((a) => a.start >= span.start && a.start < span.end)) return true;
       const argText = m[1] ?? "";
+      const argStart = m.index + m[0].length - argText.length;
       for (const v of tainted) {
-        if (new RegExp(`\\b${v.replace(/\$/g, "\\$")}\\b`).test(argText)) return true;
+        if (lang === "shell" || refOutsideData(argText, v, argStart, dataRanges)) return true;
       }
     }
     for (const m of text.matchAll(/\b(?:console\.(?:log|info|debug)|print)\s*\(([^)]*)\)/g)) {
       const span: TextRange = { start: m.index, end: m.index + m[0].length };
-      if (atoms.some((a) => a.start >= span.start && a.start < span.end)) return true;
+      if (atoms.some((a) => a.start >= span.start && a.start < span.end && (lang === "shell" || !a.inData))) return true;
       const argText = m[1] ?? "";
+      const argStart = m.index + m[0].indexOf(argText);
       for (const v of tainted) {
-        if (new RegExp(`\\b${v.replace(/\$/g, "\\$")}\\b`).test(argText)) return true;
+        if (lang === "shell" || refOutsideData(argText, v, argStart, dataRanges)) return true;
       }
     }
   }
@@ -821,7 +850,7 @@ export function classifyCommand(command: string, lang: Lang = "shell"): { classi
   }
   // Exfil is a value flow, not a co-occurrence (P-018): the credential
   // value must reach a send. Token as authentication does not count.
-  if (analyzeExfil(cmd, views.dataRanges)) {
+  if (analyzeExfil(cmd, views, lang)) {
     fired.push({ id: "ENV-EXFIL", evidence: "a credential shaped or bulk environment value flows into an outbound send (payload, query string, printed output next to a send, or a pipe into a network tool); a token used as authentication does not count" });
   }
   if (credAccess && (

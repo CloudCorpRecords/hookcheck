@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5 (2026-10-22)
+
+Re-validation fix found while re-scanning the Round 2 corpus with the published 0.1.4 binary (validation/problems.md P-024). Of the five Round 2 COMPROMISED-PATTERN targets, four cleared under 0.1.4 (langfuse, PostHog/posthog-js, attune-ai, cas). jpoley/flowspec did not: its 10,565 line CLI module still produced ENV-EXFIL, and the driver was hand traced to a false value flow inside the new analysis itself. A keyword argument default tainted the variable name `help` because its prose value mentions the word token ("GitHub token for API requests"), the print disclosure branch then matched a banner printing the word --help, and the send gate accepted the prose word fetch from a docstring as a send construct. The token in that file goes to an Authorization header for the GitHub API and nowhere else; there is no exfil.
+
+- Taint and disclosure now follow code positions only. A variable reference inside a string literal or other data range is a mention, not a use: it cannot propagate taint through an assignment, cannot make a send span tainted, and cannot count as print disclosure. References inside template and f-string interpolation holes are code and still count, and shell echo and printf arguments remain the printed values themselves.
+- The print disclosure send gate runs on the code view with data blanked, so a send word appearing only in prose no longer opens the branch.
+- Four regression tests in test/round2.test.ts (two flowspec shapes, two controls proving genuine print disclosure still fires in JavaScript and Python); 138 tests total. The flowspec module now classifies REMOTE-URL, ENV-ACCESS, ENV-BULK with no ENV-EXFIL, and the repo verdicts REVIEW.
+
 ## 0.1.4 (2026-10-22)
 
 Round 2 real-repo validation fixes (validation/problems.md P-018, P-019, P-020, and the hookcheck half of P-014). Every fix has a regression test built from the Round 2 evidence in test/round2.test.ts (28 tests, 134 total). Measured against the published 0.1.3 binary on the full Round 2 corpus: all 15 findings driving the 5 COMPROMISED-PATTERN verdicts on langfuse, PostHog/posthog-js, attune-ai, cas, and flowspec were hand-read, and none was genuinely exfil shaped; every one was the target repo's own release automation.
