@@ -8,7 +8,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type { Classification, HookFinding, HookSource, ScanReport, Verdict } from "./types.js";
 
-export const VERSION = "0.1.10";
+export const VERSION = "0.1.11";
 
 interface RuleDef {
   id: string;
@@ -156,12 +156,53 @@ function refOutsideData(seg: string, name: string, segStart: number, dataRanges:
   return refOutsideRanges(seg, name, segStart, dataRanges);
 }
 
-function refOutsideRanges(seg: string, name: string, segStart: number, ranges: TextRange[]): boolean {
+/**
+ * Positions (global indices) of genuine references to `name` inside
+ * `seg`: occurrences that do not begin inside an excluded range, are
+ * not a property name (obj.name reads a property of obj, never the
+ * variable), and are not an object or dict KEY or a parameter
+ * declaration (a name followed by ":" whose previous non-space
+ * character is "{", ",", "(", or a line start is a binding or a key,
+ * not a read). The key rule is the n8n set-latest shape (P-110): a
+ * response variable named `body` tainted by a local helper call made
+ * every fetch options object with a `body:` key read as a flow of
+ * that variable into the send. A ternary value (cond ? name : other)
+ * keeps counting: its previous character is "?", not a key context.
+ */
+function refPositions(seg: string, name: string, segStart: number, ranges: TextRange[]): number[] {
+  const out: number[] = [];
   const re = new RegExp(`\\b${name.replace(/\$/g, "\\$")}\\b`, "g");
   for (const m of seg.matchAll(re)) {
-    if (!inRanges(segStart + (m.index ?? 0), ranges)) return true;
+    const idx = m.index ?? 0;
+    if (inRanges(segStart + idx, ranges)) continue;
+    if (idx > 0 && seg[idx - 1] === ".") continue;
+    let j = idx + name.length;
+    while (j < seg.length && (seg[j] === " " || seg[j] === "\t")) j++;
+    if (seg[j] === ":") {
+      let k = idx - 1;
+      while (k >= 0 && (seg[k] === " " || seg[k] === "\t")) k--;
+      if (k < 0 || seg[k] === "{" || seg[k] === "," || seg[k] === "(" || seg[k] === "\n") continue;
+    }
+    // An assignment target is a binding, not a read: a name at a
+    // statement position followed by a single "=" (not "==" or
+    // "=>") is being bound by this statement, so a send statement
+    // that ASSIGNS its result from a command substitution carrying
+    // an authenticated curl (id_token_status="$(curl ...)") does not
+    // flow the variable anywhere by mentioning its own name.
+    if (seg[j] === "=" && seg[j + 1] !== "=" && seg[j + 1] !== ">") {
+      let k = idx - 1;
+      while (k >= 0 && (seg[k] === " " || seg[k] === "\t")) k--;
+      if (k < 0 || seg[k] === ";" || seg[k] === "\n" || seg[k] === "," || seg[k] === "{" || seg[k] === "(") continue;
+      const prevWord = seg.slice(Math.max(0, k - 6), k + 1).match(/(?:^|\s)(?:let|const|var|export)$/);
+      if (prevWord) continue;
+    }
+    out.push(segStart + idx);
   }
-  return false;
+  return out;
+}
+
+function refOutsideRanges(seg: string, name: string, segStart: number, ranges: TextRange[]): boolean {
+  return refPositions(seg, name, segStart, ranges).length > 0;
 }
 
 function blankRanges(text: string, ranges: TextRange[]): string {
@@ -987,7 +1028,7 @@ function consumeValueExpr(text: string, start: number): number {
   return i;
 }
 
-const AUTH_HEADER_KEY = /^(authorization|proxy-authorization|api[-_]?key|apikey|x-api-key|x-auth[-_]?token|auth[-_]?token|x-access[-_]?token|access[-_]?token|x-session[-_]?token|session[-_]?token)$/i;
+const AUTH_HEADER_KEY = /^(authorization|proxy-authorization|auth|api[-_]?key|apikey|x-api-key|x-auth[-_]?token|auth[-_]?token|x-access[-_]?token|access[-_]?token|x-session[-_]?token|session[-_]?token)$/i;
 
 function isAuthHeaderKey(key: string): boolean {
   const k = key.toLowerCase();
@@ -1021,9 +1062,19 @@ function isAuthHeaderKey(key: string): boolean {
  *     or request options object;
  *   - header setter calls (set, append, setHeader) and Python
  *     requests-style auth= tuples.
- * A credential that reaches a payload position (body, query, URL path,
- * printed output next to a send) still fires: only the value
- * expressions of these header positions are scrubbed.
+ * A credential that reaches a payload position (body, a data named
+ * query parameter, a partial URL path segment, printed output next
+ * to a send) still fires: only the value expressions of these
+ * positions are scrubbed.
+ *
+ * Mega-corpus (P-106, P-107): the scrub now also covers curl -u and
+ * --user basic auth pairs, the argument following a git
+ * http.extraheader key, and ::add-mask:: registrations; and
+ * destination positions inside the URL of a send (entire path
+ * segments, the whole URL, the URL origin, authentication named
+ * query parameters, the curl URL operand, and the destination first
+ * argument of a fetch style call) are computed separately in
+ * destAuthRanges, always subject to the body test.
  */
 function authRanges(text: string): TextRange[] {
   const ranges: TextRange[] = [];
@@ -1056,6 +1107,59 @@ function authRanges(text: string): TextRange[] {
     } else {
       ranges.push(valueAfter(i));
     }
+  }
+  // curl -u and --user basic authentication pairs (P-107): the flag
+  // value (user:password, usually a variable pair) is the credential
+  // presented to the destination as authentication, in exactly the
+  // position the protocol reserves for it. nodejs/node uploads its
+  // own WPT report with -u "$USER:$PASSWORD" and n8n posts to its own
+  // internal webhook with -u "name:$WEBHOOK_PASSWORD"; both fired
+  // ENV-EXFIL on 0.1.10 because the scrubber knew --token style flags
+  // but not the basic auth pair.
+  const flagValue = (from: number): void => {
+    let i = from;
+    while (i < text.length && /\s/.test(text[i])) i++;
+    if (i >= text.length) return;
+    if (text[i] === "'" || text[i] === '"' || text[i] === "`") {
+      const end = consumeLiteral(text, i);
+      ranges.push({ start: i + 1, end: Math.max(i + 1, end - 1) });
+    } else {
+      ranges.push(valueAfter(i));
+    }
+  };
+  for (const m of text.matchAll(/(?:^|[\s;|&])(?:-u|--user|--http-user|--http-password)(?:\s+|=)/g)) {
+    flagValue(m.index + m[0].length);
+  }
+  // git http.extraheader indirection (P-107): the value configured
+  // for an extraheader key IS an Authorization header value, however
+  // it was built (microsoft/TypeScript base64-encodes its app token
+  // into a variable, registers it with add-mask, and configures it as
+  // http.https://github.com/.extraheader "AUTHORIZATION: basic ...").
+  // The argument following the extraheader key is scrubbed.
+  for (const m of text.matchAll(/extraheader\b/gi)) {
+    let i = m.index + m[0].length;
+    while (i < text.length && /[\s"']/.test(text[i])) i++;
+    if (text[i] === "=" || text[i] === ":") {
+      i++;
+      while (i < text.length && /[\s"']/.test(text[i])) i++;
+    }
+    if (i >= text.length) continue;
+    if (text[i] === "'" || text[i] === '"' || text[i] === "`") {
+      const end = consumeLiteral(text, i);
+      ranges.push({ start: i + 1, end: Math.max(i + 1, end - 1) });
+    } else {
+      ranges.push(valueAfter(i));
+    }
+  }
+  // add-mask registrations: an echo whose argument is the workflow
+  // command ::add-mask::<value> registers the value for masking in
+  // the log; printing it there is the masking idiom itself, not a
+  // disclosure of the value as data.
+  for (const m of text.matchAll(/::add-mask::/g)) {
+    const start = m.index + m[0].length;
+    let end = start;
+    while (end < text.length && text[end] !== "\n" && text[end] !== '"' && text[end] !== "'") end++;
+    if (end > start) ranges.push({ start, end });
   }
   // Header setter calls and requests-style auth= tuples.
   for (const m of text.matchAll(/\b(?:set|append|setHeader|addHeader|header)\s*\(\s*["'][A-Za-z0-9-]+["']\s*,\s*/g)) {
@@ -1104,6 +1208,99 @@ function authRanges(text: string): TextRange[] {
  * Authorization value is an authentication container, not a tainted
  * payload, and passing it to fetch does not become exfil.
  */
+interface LocalFn { name: string; bodyStart: number; bodyEnd: number }
+
+/**
+ * Functions defined in the same text (P-110). Python `def` bodies are
+ * line ranges bounded by indentation; JavaScript `function` bodies
+ * and arrow function bodies are the balanced brace span after the
+ * signature. Only plain (non-method) definitions are collected.
+ */
+function localFunctions(text: string): LocalFn[] {
+  const fns: LocalFn[] = [];
+  const lines = text.split("\n");
+  const lineStart: number[] = [];
+  let off = 0;
+  for (const l of lines) { lineStart.push(off); off += l.length + 1; }
+  for (let li = 0; li < lines.length; li++) {
+    const dm = lines[li].match(/^(\s*)def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
+    if (!dm) continue;
+    const indent = dm[1].length;
+    let endLine = lines.length - 1;
+    for (let lj = li + 1; lj < lines.length; lj++) {
+      const l = lines[lj];
+      if (l.trim() === "") continue;
+      const ind = l.match(/^\s*/)?.[0].length ?? 0;
+      if (ind <= indent) { endLine = lj - 1; break; }
+    }
+    fns.push({ name: dm[2], bodyStart: lineStart[li], bodyEnd: lineStart[endLine] + lines[endLine].length });
+  }
+  const jsRe = /\bfunction\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(|(?:^|[;\n])\s*(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][A-Za-z0-9_$]*)\s*=>/g;
+  let jm: RegExpExecArray | null;
+  while ((jm = jsRe.exec(text)) !== null) {
+    const name = jm[1] ?? jm[2];
+    if (!name) continue;
+    const brace = text.indexOf("{", jm.index + jm[0].length);
+    if (brace === -1) continue;
+    fns.push({ name, bodyStart: jm.index, bodyEnd: consumeBalanced(text, brace) });
+  }
+  return fns;
+}
+
+/**
+ * True when a locally defined function returns tainted data: a return
+ * expression inside its body that references a credential atom or a
+ * tainted variable at a genuine reference position (outside data and
+ * authentication ranges), or returns the result of another local
+ * function that does (one level of recursion, depth capped).
+ */
+function fnReturnsTaint(fn: LocalFn, text: string, live: Atom[], tainted: Map<string, boolean>, dataRanges: TextRange[], auth: TextRange[], fns: LocalFn[], depth: number): boolean {
+  const body = text.slice(fn.bodyStart, fn.bodyEnd);
+  for (const m of body.matchAll(/\breturn\b/g)) {
+    const exprStart = fn.bodyStart + (m.index ?? 0) + m[0].length;
+    let exprEnd = text.indexOf("\n", exprStart);
+    if (exprEnd === -1) exprEnd = fn.bodyEnd;
+    const semi = text.indexOf(";", exprStart);
+    if (semi !== -1 && semi < exprEnd) exprEnd = semi;
+    exprEnd = Math.min(exprEnd, fn.bodyEnd);
+    const expr = text.slice(exprStart, exprEnd);
+    for (const x of live) {
+      if (x.start >= exprStart && x.start < exprEnd) return true;
+    }
+    for (const [v] of tainted) {
+      if (refOutsideRanges(expr, v, exprStart, [...dataRanges, ...auth])) return true;
+    }
+    if (depth < 2) {
+      for (const cm of expr.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g)) {
+        const inner = fns.find((f) => f.name === cm[1] && f !== fn);
+        if (inner && fnReturnsTaint(inner, text, live, tainted, dataRanges, auth, fns, depth + 1)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * The innermost plain call whose argument list contains `pos`
+ * within the assignment right-hand side, when that call is to a
+ * function defined in the same text. Returns the function, or null
+ * when the position is not inside a local call's arguments.
+ */
+function localCallAt(text: string, rhsStart: number, rhsEnd: number, pos: number, fns: LocalFn[]): LocalFn | null {
+  const rhs = text.slice(rhsStart, rhsEnd);
+  let best: { fn: LocalFn; open: number } | null = null;
+  for (const m of rhs.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g)) {
+    const nameStart = rhsStart + (m.index ?? 0);
+    if (nameStart > 0 && text[nameStart - 1] === ".") continue;
+    const fn = fns.find((f) => f.name === m[1]);
+    if (!fn) continue;
+    const open = nameStart + m[0].length - 1;
+    const span = callSpan(text, open);
+    if (pos > open && pos < span.end && (!best || open > best.open)) best = { fn, open };
+  }
+  return best?.fn ?? null;
+}
+
 function taintedVars(text: string, atoms: Atom[], dataRanges: TextRange[], auth: TextRange[] = []): Map<string, boolean> {
   const tainted = new Map<string, boolean>();
   const assignRe = /(?:^|[;\n,])\s*(?:export\s+|const\s+|let\s+|var\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*=(?![=<>])\s*/g;
@@ -1116,16 +1313,54 @@ function taintedVars(text: string, atoms: Atom[], dataRanges: TextRange[], auth:
     assigns.push({ name: m[1], rhsStart, rhsEnd });
   }
   const live = atoms.filter((a) => !a.inData);
+  const fns = localFunctions(text);
+  // Local helper taint (P-110). Passing a credential as an ARGUMENT
+  // to a function defined in the same text does not taint that call's
+  // result, unless the helper itself returns tainted data: the
+  // helper's own body is part of the analyzed text, so a credential
+  // it posts from inside is caught there directly, and a credential
+  // it only presents as authentication (the davila7 and ticker
+  // shapes: fetch_stargazers(token) and fetch_repos(token), whose
+  // results are star dates and repo metadata) never becomes the
+  // result's value. Calls to functions NOT defined in the text
+  // (JSON.stringify, encodeURIComponent, library helpers) keep the
+  // conservative rule: their result carries their arguments' taint.
+  const consumedByLocalCall = (a: { rhsStart: number; rhsEnd: number }, pos: number): boolean => {
+    if (fns.length === 0) return false;
+    const fn = localCallAt(text, a.rhsStart, a.rhsEnd, pos, fns);
+    if (!fn) return false;
+    return !fnReturnsTaint(fn, text, live, tainted, dataRanges, auth, fns, 0);
+  };
   for (let pass = 0; pass < 4; pass++) {
     for (const a of assigns) {
       if (tainted.has(a.name)) continue;
       const sources: boolean[] = [];
+      // Destination positions inside the right-hand side do not
+      // taint the RESULT of a call or command substitution either
+      // (P-106): a variable assigned a send's result (a status code,
+      // a response) does not carry the credential that was presented
+      // in the send's URL. The skip applies only inside a call or
+      // substitution span: a plain string or expression that
+      // CONTAINS a destination atom (a capability URL built into a
+      // variable) keeps its taint, because printing or posting that
+      // variable would disclose the credential.
+      const dest = destAuthRanges(text, { start: a.rhsStart, end: a.rhsEnd }, true)
+        .filter((r) => {
+          const rhs = text.slice(a.rhsStart, a.rhsEnd);
+          for (const cm of rhs.matchAll(/\$\(|[A-Za-z_$][A-Za-z0-9_$]*\s*\(/g)) {
+            const open = a.rhsStart + (cm.index ?? 0) + cm[0].length - 1;
+            const span = callSpan(text, open);
+            if (r.start >= span.start && r.start < span.end) return true;
+          }
+          return false;
+        });
       for (const x of live) {
-        if (x.start >= a.rhsStart && x.start < a.rhsEnd) sources.push(x.pure === true);
+        if (x.start >= a.rhsStart && x.start < a.rhsEnd && !consumedByLocalCall(a, x.start) && !inRanges(x.start, dest)) sources.push(x.pure === true);
       }
       const rhs = text.slice(a.rhsStart, a.rhsEnd);
       for (const [v, vPure] of tainted) {
-        if (refOutsideRanges(rhs, v, a.rhsStart, [...dataRanges, ...auth])) sources.push(vPure);
+        const positions = refPositions(rhs, v, a.rhsStart, [...dataRanges, ...auth]);
+        if (positions.some((p) => !consumedByLocalCall(a, p) && !inRanges(p, dest))) sources.push(vPure);
       }
       if (sources.length > 0) tainted.set(a.name, sources.every(Boolean));
     }
@@ -1157,11 +1392,11 @@ function callSpan(text: string, openIdx: number): TextRange {
  * A span carrying even one impure hit (a credential shaped read, a
  * serialization of the whole environment) is an impure flow.
  */
-function spanHasTaint(text: string, span: TextRange, atoms: Atom[], tainted: Map<string, boolean>, dataRanges: TextRange[], auth: TextRange[] = []): { found: boolean; pure: boolean } {
+function spanHasTaint(text: string, span: TextRange, atoms: Atom[], tainted: Map<string, boolean>, dataRanges: TextRange[], auth: TextRange[] = [], extra: TextRange[] = []): { found: boolean; pure: boolean } {
   let found = false;
   let pure = true;
   for (const a of atoms) {
-    if (!a.inData && a.start >= span.start && a.start < span.end) {
+    if (!a.inData && a.start >= span.start && a.start < span.end && !inRanges(a.start, extra)) {
       found = true;
       if (a.pure !== true) pure = false;
     }
@@ -1169,13 +1404,206 @@ function spanHasTaint(text: string, span: TextRange, atoms: Atom[], tainted: Map
   if (tainted.size > 0) {
     const seg = text.slice(span.start, span.end);
     for (const [v, vPure] of tainted) {
-      if (refOutsideRanges(seg, v, span.start, [...dataRanges, ...auth])) {
+      if (refOutsideRanges(seg, v, span.start, [...dataRanges, ...auth, ...extra])) {
         found = true;
         if (!vPure) pure = false;
       }
     }
   }
   return { found, pure };
+}
+
+/**
+ * Body ranges inside one send span or statement: the values handed
+ * to curl data flags (-d, --data*, -F, --form, --json) and to body,
+ * data, json, or payload properties and keyword arguments. A
+ * credential inside a body range is payload by construction; the
+ * destination rules below never scrub inside a body range, which is
+ * what makes the body test decisive (P-106): a capability URL shape
+ * PLUS credential data in the body still fires.
+ */
+function bodyRanges(text: string, span: TextRange): TextRange[] {
+  const ranges: TextRange[] = [];
+  const seg = text.slice(span.start, span.end);
+  for (const m of seg.matchAll(/(?:^|\s)(?:-d|--data(?:-raw|-binary|-urlencode|-ascii)?|--form(?:-string)?|-F|--json)(?:\s+|=)/g)) {
+    let i = span.start + (m.index ?? 0) + m[0].length;
+    while (i < span.end && /\s/.test(text[i])) i++;
+    if (i >= span.end) continue;
+    if (text[i] === "'" || text[i] === '"' || text[i] === "`") {
+      ranges.push({ start: i, end: Math.min(span.end, consumeLiteral(text, i)) });
+    } else {
+      let end = i;
+      while (end < span.end && !/[\s,;]/.test(text[end])) end++;
+      ranges.push({ start: i, end });
+    }
+  }
+  for (const m of seg.matchAll(/\b(?:body|data|json|payload)\s*[:=]\s*/g)) {
+    const start = span.start + (m.index ?? 0) + m[0].length;
+    const end = consumeValueExpr(text, start);
+    if (end > start) ranges.push({ start, end: Math.min(end, span.end) });
+  }
+  return ranges;
+}
+
+const AUTH_PARAM_NAME = /^(?:.*[-_])?(?:token|api[-_]?key|access[-_]?token|auth|secret|signature|sig|key|session[-_]?id)$/i;
+
+/** True when a URL path segment is exactly one reference (a variable, an Actions expression, a template or f-string hole). */
+function segmentRefRange(seg: string, segGlobalStart: number): TextRange | null {
+  const t = seg.replace(/^["'`(]+/, "").replace(/["'`),;]+$/, "");
+  const lead = seg.length - seg.replace(/^["'`(]+/, "").length;
+  const base = segGlobalStart + lead;
+  if (/^\$\{\{[^}]*\}\}$/.test(t) || /^\$\{[^}]*\}$/.test(t) || /^\$[A-Za-z_][A-Za-z0-9_]*$/.test(t) || /^\{[A-Za-z_][A-Za-z0-9_.]*\}$/.test(t)) {
+    return { start: base, end: base + t.length };
+  }
+  return null;
+}
+
+/**
+ * Destination authentication ranges inside one send span or
+ * statement (P-106, P-107). A credential PRESENTED in the URL of a
+ * send authenticates that send to the destination: capability URLs
+ * are credentials by design (a Netlify build hook URL, a preview
+ * token as a path segment, a token query parameter), and the URL a
+ * configuration expression expands to is the destination itself.
+ * Recognized presentations:
+ *   - a reference that is an entire URL path segment;
+ *   - the value of an authentication named query parameter (token,
+ *     api_key, access_token, auth, secret, signature, key, and their
+ *     prefixed forms); a data named parameter (?t=, ?q=, ?payload=)
+ *     is NOT a presentation and keeps firing;
+ *   - a reference at the start of a URL token, in the origin position
+ *     (an expression or variable the rest of the URL is built on);
+ *   - the whole URL token when it is exactly one reference;
+ *   - in a curl or wget statement, a bare reference token in the URL
+ *     operand position (not a flag value): the Actions OIDC request
+ *     URL variable shape.
+ * Nothing inside a body range is scrubbed here, and a reference in
+ * any other URL position (a partial path segment, a data parameter)
+ * is payload and keeps full exfil weight.
+ */
+function destAuthRanges(text: string, span: TextRange, isStatement: boolean): TextRange[] {
+  const ranges: TextRange[] = [];
+  const bodies = bodyRanges(text, span);
+  const inBody = (r: TextRange): boolean => bodies.some((b) => r.start >= b.start && r.start < b.end);
+  const seg = text.slice(span.start, span.end);
+  const tokenRe = /[^\s]+/g;
+  let tm: RegExpExecArray | null;
+  while ((tm = tokenRe.exec(seg)) !== null) {
+    const tokStart = span.start + (tm.index ?? 0);
+    const tok = tm[0];
+    const tokEnd = tokStart + tok.length;
+    if (inBody({ start: tokStart, end: tokEnd })) continue;
+    const schemeAt = tok.indexOf("://");
+    if (schemeAt !== -1) {
+      // Authority ends at the first path, query, or fragment char.
+      let authEnd = tok.length;
+      for (let i = schemeAt + 3; i < tok.length; i++) {
+        if (tok[i] === "/" || tok[i] === "?" || tok[i] === "#") { authEnd = i; break; }
+      }
+      // Path segments that are exactly one reference.
+      let p = authEnd;
+      while (p < tok.length && tok[p] === "/") {
+        let q = p + 1;
+        while (q < tok.length && tok[q] !== "/" && tok[q] !== "?" && tok[q] !== "#") q++;
+        const r = segmentRefRange(tok.slice(p + 1, q), tokStart + p + 1);
+        if (r) ranges.push(r);
+        p = q;
+        if (tok[p] === "?" || tok[p] === "#") break;
+      }
+      // Authentication named query parameters.
+      const qAt = tok.indexOf("?");
+      if (qAt !== -1) {
+        let qs = tok.slice(qAt + 1);
+        const hash = qs.indexOf("#");
+        if (hash !== -1) qs = qs.slice(0, hash);
+        let off = qAt + 1;
+        for (const part of qs.split("&")) {
+          const eq = part.indexOf("=");
+          if (eq > 0 && AUTH_PARAM_NAME.test(part.slice(0, eq))) {
+            ranges.push({ start: tokStart + off + eq + 1, end: tokStart + off + part.length });
+          }
+          off += part.length + 1;
+        }
+      }
+      continue;
+    }
+    // Expression or variable led token: the leading reference in the
+    // origin position, or the whole token as one reference.
+    const lead = tok.replace(/^["'`(]+/, "");
+    const leadOff = tok.length - lead.length;
+    const ref = lead.match(/^\$\{\{[^}]*\}\}|^\$\{[^}]*\}|^\$[A-Za-z_][A-Za-z0-9_]*/);
+    if (ref) {
+      const after = lead[ref[0].length] ?? "";
+      if (after === "" || after === "/" || after === "?" || after === "#") {
+        ranges.push({ start: tokStart + leadOff, end: tokStart + leadOff + ref[0].length });
+      }
+      continue;
+    }
+    // A bare reference token in a curl statement's operand position.
+    if (isStatement) {
+      const bare = tok.replace(/^["'`(]+/, "").replace(/["'`),;]+$/, "");
+      if (/^\{[A-Za-z_][A-Za-z0-9_.]*\}$/.test(bare)) {
+        ranges.push({ start: tokStart, end: tokEnd });
+      }
+    }
+  }
+  if (isStatement) {
+    // Bare operand variables: tokenize with flag value awareness.
+    const VALUE_FLAGS = new Set(["-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--data-ascii", "-F", "--form", "--form-string", "-H", "--header", "-u", "--user", "-o", "--output", "-X", "--request", "-e", "--referer", "-A", "--user-agent", "-b", "--cookie", "-c", "--cookie-jar", "--cert", "--key", "--cacert", "--connect-timeout", "--max-time", "--retry", "--url", "-T", "--upload-file", "--json", "--oauth2-bearer", "-m", "-E"]);
+    const toks = Array.from(seg.matchAll(/[^\s]+/g));
+    let prevWasValueFlag = false;
+    for (const t of toks) {
+      const raw = t[0];
+      const start = span.start + (t.index ?? 0);
+      const clean = raw.replace(/^["'`(]+/, "").replace(/["'`),;]+$/, "");
+      if (!prevWasValueFlag && /^(?:\$[A-Za-z_][A-Za-z0-9_]*|\$\{[^}]*\}|\$\{\{[^}]*\}\})$/.test(clean) && !inBody({ start, end: start + raw.length })) {
+        ranges.push({ start, end: start + raw.length });
+      }
+      if (raw.includes("=") && raw.startsWith("--")) prevWasValueFlag = false;
+      else if (VALUE_FLAGS.has(raw)) prevWasValueFlag = true;
+      else prevWasValueFlag = false;
+    }
+  }
+  return ranges;
+}
+
+/** The first argument span of a call whose "(" is at openIdx. */
+function firstArgSpan(text: string, openIdx: number): TextRange {
+  let depth = 0;
+  let quote = "";
+  for (let j = openIdx; j < text.length; j++) {
+    const c = text[j];
+    if (quote) {
+      if (c === "\\") { j++; continue; }
+      if (c === quote) quote = "";
+      continue;
+    }
+    if (c === "'" || c === '"' || c === "`") { quote = c; continue; }
+    if (c === "(" || c === "[" || c === "{") depth++;
+    else if (c === ")" || c === "]" || c === "}") { depth--; if (depth === 0) return { start: openIdx + 1, end: j }; }
+    else if (c === "," && depth === 1) return { start: openIdx + 1, end: j };
+  }
+  return { start: openIdx + 1, end: text.length };
+}
+
+/**
+ * Aggregate ranges inside a printed argument (P-110): a length or
+ * count of a value is metadata about the value, not the value (the
+ * P-020 principle: ${#NAME} is a length, not a read). References
+ * inside len(...), count(...), or size(...) calls, and the object of
+ * a .length or .size property, do not count as print disclosure.
+ */
+function aggregateRanges(argText: string, argStart: number): TextRange[] {
+  const ranges: TextRange[] = [];
+  for (const m of argText.matchAll(/\b(?:len|count|size)\s*\(/g)) {
+    const openLocal = (m.index ?? 0) + m[0].length - 1;
+    const local = callSpan(argText, openLocal);
+    ranges.push({ start: argStart + (m.index ?? 0), end: argStart + local.end });
+  }
+  for (const m of argText.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*(?:length|size)\b/g)) {
+    ranges.push({ start: argStart + (m.index ?? 0), end: argStart + (m.index ?? 0) + m[1].length });
+  }
+  return ranges.filter((r) => r.end > r.start);
 }
 
 /**
@@ -1203,7 +1631,54 @@ function spanHasTaint(text: string, span: TextRange, atoms: Atom[], tainted: Map
 function analyzeExfil(text: string, views: Views, lang: Lang): boolean {
   const dataRanges = views.dataRanges;
   const auth = authRanges(text);
-  const atoms = findAtoms(text, dataRanges).filter((a) => !inRanges(a.start, auth));
+  const rawAtoms = findAtoms(text, dataRanges).filter((a) => !inRanges(a.start, auth));
+  // Bound-clean shell variables (P-107, the n8n OIDC probe shape):
+  // a $NAME occurrence is a credential atom by NAME, but when the
+  // same text assigns that name from a value that contains no
+  // credential atom at all, the name is bound to a known
+  // non-credential value in this scope: ID_TOKEN_RESPONSE bound to
+  // "$RUNNER_TEMP/npm-oidc-id-token.json" is a response FILE PATH
+  // (used as a curl --output sink), not a token. A name bound from a
+  // credential (TOKEN2="$API_TOKEN") keeps its atom, and a name never
+  // assigned in the text (a runner or environment provided value)
+  // keeps it too.
+  const boundClean = new Set<string>();
+  {
+    const assignRe = /(?:^|[;\n,])\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(?![=<>])\s*/g;
+    let am: RegExpExecArray | null;
+    while ((am = assignRe.exec(text)) !== null) {
+      const rhsStart = am.index + am[0].length;
+      let rhsEnd = rhsStart;
+      while (rhsEnd < text.length && text[rhsEnd] !== ";" && text[rhsEnd] !== "\n") rhsEnd++;
+      // Atoms of names already proven bound-clean (a literal path
+      // variable used as an output sink) are not credential atoms
+      // for this test either: cleanliness is transitive.
+      const inRhs = rawAtoms.filter((x) => {
+        if (x.start < rhsStart || x.start >= rhsEnd) return false;
+        const nm = text.slice(x.start, x.end).match(/^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/);
+        return !(nm && boundClean.has(nm[1]));
+      });
+      if (inRhs.length === 0) { boundClean.add(am[1]); continue; }
+      // A name bound to the RESULT of a command substitution whose
+      // only credential atoms sit in destination positions of the
+      // substituted send is bound to that result (the OIDC probe's
+      // id_token_status is an HTTP status code), not to the
+      // credential presented in the URL. A name bound to a plain
+      // string or expression that CONTAINS a destination atom (a
+      // capability URL held in a variable) is not clean: printing
+      // that variable would print the credential.
+      const rhsText = text.slice(rhsStart, rhsEnd);
+      if (rhsText.includes("$(")) {
+        const dest = destAuthRanges(text, { start: rhsStart, end: rhsEnd }, true);
+        if (inRhs.every((x) => inRanges(x.start, dest))) boundClean.add(am[1]);
+      }
+    }
+  }
+  const atoms = rawAtoms.filter((a) => {
+    if (a.kind !== "cred") return true;
+    const m = text.slice(a.start, a.end).match(/^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/);
+    return !(m && boundClean.has(m[1]));
+  });
   // Inheritance purity (P-091): a bulk atom inside an inheritance
   // expression passed as a subprocess env= is marked pure. Flows are
   // accumulated with their purity instead of returning at the first
@@ -1227,6 +1702,25 @@ function analyzeExfil(text: string, views: Views, lang: Lang): boolean {
     if (r.pure) sawPureFlow = true; else sawImpureFlow = true;
   };
   const has = (span: TextRange): void => note(spanHasTaint(text, span, atoms, tainted, dataRanges, auth));
+  // Destination aware variant (P-106): taint that sits only in a
+  // destination position (a capability URL presentation, the URL
+  // operand, or the destination first argument of a fetch style
+  // call) is authentication, not a flow into a send. Taint anywhere
+  // else in the span - above all in a body range - fires as before.
+  const hasDest = (span: TextRange, isStatement: boolean, firstArg: boolean): void => {
+    const extra = destAuthRanges(text, span, isStatement);
+    if (firstArg) {
+      const open = text.indexOf("(", span.start);
+      if (open !== -1 && open < span.end) {
+        const fa = firstArgSpan(text, open);
+        const faText = text.slice(fa.start, fa.end).trim();
+        const bodies = bodyRanges(text, span);
+        const faHasBody = bodies.some((b) => b.start >= fa.start && b.start < fa.end);
+        if (!faText.startsWith("{") && !faHasBody) extra.push(fa);
+      }
+    }
+    note(spanHasTaint(text, span, atoms, tainted, dataRanges, auth, extra));
+  };
 
   const callRes: RegExp[] = [
     /\bfetch\s*\(/g,
@@ -1240,7 +1734,12 @@ function analyzeExfil(text: string, views: Views, lang: Lang): boolean {
   for (const re of callRes) {
     let m: RegExpExecArray | null;
     while ((m = re.exec(text)) !== null) {
-      has(callSpan(text, m.index + m[0].length - 1));
+      const span = callSpan(text, m.index + m[0].length - 1);
+      // XHR .send( takes the BODY as its argument, so it keeps the
+      // plain rule; every other send call takes its destination
+      // first, so its first argument is a destination position.
+      if (re.source.includes("send")) has(span);
+      else hasDest(span, false, true);
     }
   }
 
@@ -1254,7 +1753,7 @@ function analyzeExfil(text: string, views: Views, lang: Lang): boolean {
     let isFetchStmt = false;
     for (const p of positions) { if (p >= stmt.start && p < stmt.end) { isFetchStmt = true; break; } }
     if (!isFetchStmt) continue;
-    has(stmt);
+    hasDest(stmt, true, false);
   }
 
   for (const stmt of statements) {
@@ -1286,24 +1785,33 @@ function analyzeExfil(text: string, views: Views, lang: Lang): boolean {
   if (hasSendConstruct) {
     for (const m of text.matchAll(/(?:^|[;\n|&]\s*)(?:echo|printf)\s+([^\n;|]*)/g)) {
       const span: TextRange = { start: m.index, end: m.index + m[0].length };
-      for (const a of atoms) {
-        if (a.start >= span.start && a.start < span.end) note({ found: true, pure: a.pure === true });
-      }
       const argText = m[1] ?? "";
       const argStart = m.index + m[0].length - argText.length;
+      const agg = aggregateRanges(argText, argStart);
+      for (const a of atoms) {
+        if (a.start >= span.start && a.start < span.end && !inRanges(a.start, agg)) note({ found: true, pure: a.pure === true });
+      }
       for (const [v, vPure] of tainted) {
-        if (lang === "shell" || refOutsideRanges(argText, v, argStart, [...dataRanges, ...auth])) note({ found: true, pure: vPure });
+        // Shell echo arguments are the printed values themselves, so
+        // a reference inside a quoted argument still counts; what
+        // does not count is a reference inside an authentication or
+        // masking position (the add-mask registration) or inside an
+        // aggregate (a printed length or count).
+        const ranges = lang === "shell" ? [...auth, ...agg] : [...dataRanges, ...auth, ...agg];
+        if (refOutsideRanges(argText, v, argStart, ranges)) note({ found: true, pure: vPure });
       }
     }
     for (const m of text.matchAll(/\b(?:console\.(?:log|info|debug)|print)\s*\(([^)]*)\)/g)) {
       const span: TextRange = { start: m.index, end: m.index + m[0].length };
-      for (const a of atoms) {
-        if (a.start >= span.start && a.start < span.end && (lang === "shell" || !a.inData)) note({ found: true, pure: a.pure === true });
-      }
       const argText = m[1] ?? "";
       const argStart = m.index + m[0].indexOf(argText);
+      const agg = aggregateRanges(argText, argStart);
+      for (const a of atoms) {
+        if (a.start >= span.start && a.start < span.end && (lang === "shell" || !a.inData) && !inRanges(a.start, agg)) note({ found: true, pure: a.pure === true });
+      }
       for (const [v, vPure] of tainted) {
-        if (lang === "shell" || refOutsideRanges(argText, v, argStart, [...dataRanges, ...auth])) note({ found: true, pure: vPure });
+        const ranges = lang === "shell" ? [...auth, ...agg] : [...dataRanges, ...auth, ...agg];
+        if (refOutsideRanges(argText, v, argStart, ranges)) note({ found: true, pure: vPure });
       }
     }
   }
