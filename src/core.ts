@@ -8,7 +8,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type { Classification, HookFinding, HookSource, ScanReport, Verdict } from "./types.js";
 
-export const VERSION = "0.1.7";
+export const VERSION = "0.1.8";
 
 interface RuleDef {
   id: string;
@@ -1582,22 +1582,71 @@ function scanOnePackageJson(root: string, rel: string, findings: HookFinding[], 
 }
 
 /**
- * Nested package.json discovery (P-032). Install scripts in workspace
- * subpackages (packages/foo, apps/web) run on a root install, so a
- * root-only scan misses exactly the surface a worm would persist in.
- * The walk is bounded so a hostile or giant tree cannot explode the
- * report: directories are visited in sorted order to depth
- * PACKAGE_MAX_DEPTH (the package.json directory depth below the root),
- * node_modules, .git, and dot directories are never entered, symlinked
- * directories are never followed (a symlink loop cannot hang the scan),
- * and at most PACKAGE_MAX_NESTED nested files are inventoried, with the
- * cap reported as a warning when it is hit.
+ * Unified nested discovery (P-032, P-060, P-065). Every surface the
+ * tool inventories at the scan root is also inventoried when it
+ * appears inside a subdirectory: before v0.1.8 only nested package.json
+ * files (P-032) and plugin hooks files (P-060) were recursed, so a
+ * parent scan of a monorepo or workspace silently missed nested
+ * .claude/settings.json, .vscode/tasks.json, workflows, husky and
+ * githooks directories, lefthook and pre-commit configs, and MCP
+ * configs, and a tree holding only nested surfaces scanned CLEAN with
+ * the empty estate note attached (P-065).
+ *
+ * One bounded walk enumerates every project root (each directory at
+ * most NESTED_MAX_DEPTH levels below the scan root, the scan root
+ * itself included) plus the nested package.json and plugin hooks file
+ * lists. Per surface scanners then run once per project root with the
+ * root prefix carried into every finding file path, so findings carry
+ * their real relative paths. The walk is bounded so a hostile or
+ * giant tree cannot explode the report: directories are visited in
+ * sorted order, node_modules, .git, and dot directories are never
+ * entered, symlinked directories are never followed (a symlink loop
+ * cannot hang the scan), and each surface family inventories at most
+ * NESTED_MAX_FILES_PER_SURFACE nested files, with the cap reported as
+ * a warning when it is hit. When directories remain below the depth
+ * bound the walk says so in a warning naming the bound, and it probes
+ * the directories just below the bound (names only, no file reads) so
+ * surfaces sitting there are counted in the warning instead of being
+ * silently dropped.
  */
-export const PACKAGE_MAX_DEPTH = 4;
-export const PACKAGE_MAX_NESTED = 200;
+export const NESTED_MAX_DEPTH = 4;
+export const NESTED_MAX_FILES_PER_SURFACE = 200;
+export const PACKAGE_MAX_DEPTH = NESTED_MAX_DEPTH;
+export const PACKAGE_MAX_NESTED = NESTED_MAX_FILES_PER_SURFACE;
+export const PLUGIN_HOOKS_MAX_DEPTH = NESTED_MAX_DEPTH;
+export const PLUGIN_HOOKS_MAX_FILES = NESTED_MAX_FILES_PER_SURFACE;
 
-function discoverNestedPackageJson(root: string, warnings: string[]): string[] {
-  const found: string[] = [];
+const SURFACE_FILE_INDICATORS = new Set([
+  "package.json", "lefthook.yml", "lefthook.yaml", ".lefthook.yml", ".lefthook.yaml",
+  ".pre-commit-config.yaml", ".pre-commit-config.yml", ".mcp.json", "mcp.json",
+]);
+const SURFACE_DIR_INDICATORS = new Set([
+  ".claude", "claude", ".vscode", ".github", ".husky", ".githooks",
+  "hooks", ".cursor", ".windsurf", ".codex",
+]);
+
+export interface Discovery {
+  /** Project root prefixes, scan root ("") first, then sorted. */
+  projectRoots: string[];
+  /** Nested package.json relative paths (scan root excluded), sorted, uncapped. */
+  packageFiles: string[];
+  /** Plugin hooks file relative paths, sorted, uncapped. */
+  pluginHookFiles: string[];
+  /** Directories just below the depth bound that were not entered. */
+  frontierDirs: number;
+  /** Frontier directories whose listing shows a hook surface file or config directory. */
+  surfacesBelowBound: number;
+  /** True when the depth bound left directories unentered. */
+  depthBoundHit: boolean;
+}
+
+function discoverSurfaces(root: string, warnings: string[]): Discovery {
+  const projectRoots: string[] = [];
+  const packageFiles: string[] = [];
+  const pluginSet = new Set<string>();
+  let frontierDirs = 0;
+  let surfacesBelowBound = 0;
+  let probes = 0;
   const skipDirs = new Set(["node_modules", ".git"]);
   const stack: Array<{ abs: string; rel: string; depth: number }> = [{ abs: root, rel: "", depth: 0 }];
   while (stack.length > 0) {
@@ -1608,31 +1657,118 @@ function discoverNestedPackageJson(root: string, warnings: string[]): string[] {
       continue;
     }
     entries.sort();
+    projectRoots.push(cur.rel);
     if (cur.depth >= 1 && entries.includes("package.json")) {
-      found.push(cur.rel === "" ? "package.json" : `${cur.rel}/package.json`);
+      packageFiles.push(`${cur.rel}/package.json`);
     }
-    if (cur.depth >= PACKAGE_MAX_DEPTH) continue;
-    // Push in reverse so the stack pops in sorted order.
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const name = entries[i];
+    // Plugin hooks files sit in a hooks directory one level below the
+    // plugin root, so they are spotted from the plugin root listing
+    // (the hooks directory itself can sit at depth bound plus one).
+    if (entries.includes("hooks")) {
+      const hooksAbs = join(cur.abs, "hooks");
+      let lst = null;
+      try { lst = lstatSync(hooksAbs); } catch { lst = null; }
+      if (lst && lst.isDirectory() && !lst.isSymbolicLink()) {
+        let hookEntries: string[] = [];
+        try { hookEntries = readdirSync(hooksAbs); } catch { hookEntries = []; }
+        for (const name of ["hooks.json", "hooks-cursor.json"]) {
+          if (hookEntries.includes(name)) pluginSet.add(cur.rel === "" ? `hooks/${name}` : `${cur.rel}/hooks/${name}`);
+        }
+      }
+    }
+    const children: Array<{ abs: string; rel: string; depth: number }> = [];
+    for (const name of entries) {
       if (skipDirs.has(name) || name.startsWith(".")) continue;
       const childAbs = join(cur.abs, name);
       let lst; try { lst = lstatSync(childAbs); } catch { continue; }
       if (lst.isSymbolicLink() || !lst.isDirectory()) continue;
-      stack.push({ abs: childAbs, rel: cur.rel === "" ? name : `${cur.rel}/${name}`, depth: cur.depth + 1 });
+      children.push({ abs: childAbs, rel: cur.rel === "" ? name : `${cur.rel}/${name}`, depth: cur.depth + 1 });
     }
+    if (cur.depth >= NESTED_MAX_DEPTH) {
+      frontierDirs += children.length;
+      for (const child of children) {
+        if (probes >= 1000) break;
+        probes++;
+        let sub: string[] = [];
+        try { sub = readdirSync(child.abs); } catch { continue; }
+        if (sub.some((n) => SURFACE_FILE_INDICATORS.has(n) || SURFACE_DIR_INDICATORS.has(n))) surfacesBelowBound++;
+      }
+      continue;
+    }
+    // Push in reverse so the stack pops in sorted order.
+    for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
   }
-  found.sort();
-  if (found.length > PACKAGE_MAX_NESTED) {
-    warnings.push(`Nested package.json inventory capped at ${PACKAGE_MAX_NESTED} files (${found.length} found); the remaining nested package.json files were not inventoried and the scan is partial`);
-    return found.slice(0, PACKAGE_MAX_NESTED);
-  }
-  return found;
+  projectRoots.sort((a, b) => (a === b ? 0 : a === "" ? -1 : b === "" ? 1 : a < b ? -1 : 1));
+  packageFiles.sort();
+  return {
+    projectRoots,
+    packageFiles,
+    pluginHookFiles: Array.from(pluginSet).sort(),
+    frontierDirs,
+    surfacesBelowBound,
+    depthBoundHit: frontierDirs > 0,
+  };
 }
 
-function scanPackageJson(root: string, findings: HookFinding[], warnings: string[]): void {
+/**
+ * Shared per scan state for nested inventory: the discovery result,
+ * the set of files already inventoried (a surface file is inventoried
+ * exactly once however many discovery paths reach it, the P-035
+ * lesson), per family nested counts for the file cap, and a partial
+ * flag set whenever a cap or bound left part of the estate unscanned.
+ */
+interface ScanState {
+  disc: Discovery;
+  inventoried: Set<string>;
+  familyFound: Map<string, number>;
+  familyCapped: Map<string, number>;
+  partial: boolean;
+}
+
+const FAMILY_LABELS: Record<string, string> = {
+  settings: "Claude settings",
+  tasks: "VS Code tasks",
+  workflows: "workflow",
+  husky: "husky hook",
+  githooks: "githooks hook",
+  lefthook: "lefthook config",
+  "pre-commit": "pre-commit config",
+  mcp: "MCP config",
+  agent: "agent config",
+};
+
+/**
+ * Claim one surface file for inventory. Returns false when the file
+ * was already inventoried through another discovery path, or when the
+ * nested file cap for its family is already spent (the skip is
+ * counted, and scanHooks warns once per capped family).
+ */
+function claimFile(state: ScanState, family: string, rel: string, isNested: boolean): boolean {
+  if (state.inventoried.has(rel)) return false;
+  if (isNested) {
+    const found = (state.familyFound.get(family) ?? 0) + 1;
+    state.familyFound.set(family, found);
+    if (found > NESTED_MAX_FILES_PER_SURFACE) {
+      state.familyCapped.set(family, (state.familyCapped.get(family) ?? 0) + 1);
+      state.partial = true;
+      return false;
+    }
+  }
+  state.inventoried.add(rel);
+  return true;
+}
+
+function scanPackageJson(root: string, findings: HookFinding[], warnings: string[], state: ScanState): void {
   scanOnePackageJson(root, "package.json", findings, warnings);
-  for (const rel of discoverNestedPackageJson(root, warnings)) {
+  state.inventoried.add("package.json");
+  let nested = state.disc.packageFiles;
+  if (nested.length > PACKAGE_MAX_NESTED) {
+    warnings.push(`Nested package.json inventory capped at ${PACKAGE_MAX_NESTED} files (${nested.length} found); the remaining nested package.json files were not inventoried and the scan is partial`);
+    state.partial = true;
+    nested = nested.slice(0, PACKAGE_MAX_NESTED);
+  }
+  for (const rel of nested) {
+    state.inventoried.add(rel);
     scanOnePackageJson(root, rel, findings, warnings);
   }
 }
@@ -1658,45 +1794,58 @@ function collectClaudeHooks(node: unknown, file: string, root: string, findings:
  * the GNU stow layout used by real dotfiles repos (claude/settings.json,
  * no dot), and a settings file nested one level under a config dir
  * (config/.claude/settings.json). A settings path that exists as a
- * directory is reported as a warning, never silently skipped.
+ * directory is reported as a warning, never silently skipped. Since
+ * v0.1.8 (P-065) the candidates are computed per project root, so the
+ * same locations are inventoried in every subdirectory within the
+ * discovery bound; the inventoried set in ScanState keeps a file
+ * reachable by two paths (a parent root one level candidate and its
+ * own project root) counted exactly once.
  */
-function claudeSettingsCandidates(root: string): string[] {
+function claudeSettingsCandidates(root: string, prefix: string): string[] {
+  const base = prefix === "" ? "" : `${prefix}/`;
   const rels = [
-    ".claude/settings.json", ".claude/settings.local.json",
-    "claude/settings.json", "claude/settings.local.json",
+    `${base}.claude/settings.json`, `${base}.claude/settings.local.json`,
+    `${base}claude/settings.json`, `${base}claude/settings.local.json`,
   ];
   let entries: string[] = [];
-  try { entries = readdirSync(root); } catch { entries = []; }
+  try { entries = readdirSync(join(root, prefix)); } catch { entries = []; }
   for (const name of entries.sort()) {
     if (name === "node_modules" || name === ".git") continue;
-    let st; try { st = statSync(join(root, name)); } catch { continue; }
+    let st; try { st = statSync(join(root, prefix, name)); } catch { continue; }
     if (!st.isDirectory()) continue;
     for (const f of ["settings.json", "settings.local.json"]) {
-      rels.push(`${name}/.claude/${f}`);
+      rels.push(`${base}${name}/.claude/${f}`);
     }
   }
   return Array.from(new Set(rels));
 }
 
-function scanClaude(root: string, findings: HookFinding[], warnings: string[]): void {
-  for (const rel of claudeSettingsCandidates(root)) {
-    const abs = join(root, rel);
-    if (!existsSync(abs)) continue;
-    let st; try { st = statSync(abs); } catch { continue; }
-    if (st.isDirectory()) {
-      warnings.push(`${rel} is a directory, not a settings file: any hooks inside it cannot be parsed as Claude settings`);
-      continue;
+function scanClaude(root: string, findings: HookFinding[], warnings: string[], state: ScanState): void {
+  for (const prefix of state.disc.projectRoots) {
+    const baseAbs = prefix === "" ? root : join(root, prefix);
+    for (const rel of claudeSettingsCandidates(root, prefix)) {
+      const abs = join(root, rel);
+      if (!existsSync(abs)) continue;
+      let st; try { st = statSync(abs); } catch { continue; }
+      if (st.isDirectory()) {
+        if (!state.inventoried.has(rel)) {
+          state.inventoried.add(rel);
+          warnings.push(`${rel} is a directory, not a settings file: any hooks inside it cannot be parsed as Claude settings`);
+        }
+        continue;
+      }
+      if (!st.isFile()) continue;
+      if (!claimFile(state, "settings", rel, prefix !== "")) continue;
+      const data = readJson(root, rel, warnings) as Record<string, unknown> | null;
+      if (!data || typeof data !== "object") continue;
+      if (!("hooks" in data)) { warnings.push(`No hooks key in ${rel}`); continue; }
+      const hooks = data.hooks;
+      if (!hooks || typeof hooks !== "object") {
+        warnings.push(`hooks key in ${rel} is not an object: hooks skipped`);
+        continue;
+      }
+      collectClaudeHooks(hooks, rel, root, findings, "", "claude-settings", baseAbs);
     }
-    if (!st.isFile()) continue;
-    const data = readJson(root, rel, warnings) as Record<string, unknown> | null;
-    if (!data || typeof data !== "object") continue;
-    if (!("hooks" in data)) { warnings.push(`No hooks key in ${rel}`); continue; }
-    const hooks = data.hooks;
-    if (!hooks || typeof hooks !== "object") {
-      warnings.push(`hooks key in ${rel} is not an object: hooks skipped`);
-      continue;
-    }
-    collectClaudeHooks(hooks, rel, root, findings, "");
   }
 }
 
@@ -1718,55 +1867,21 @@ function scanClaude(root: string, findings: HookFinding[], warnings: string[]): 
  * command object shape under Cursor event names, so it is inventoried
  * the same way.
  *
- * The walk mirrors the nested package.json discipline (P-032): sorted
- * order, node_modules, .git, and dot directories never entered,
- * symlinked directories never followed, and a cap with a warning. The
- * depth bound applies to the plugin root (at most PLUGIN_HOOKS_MAX_DEPTH
- * directories below the scan root); the hooks directory itself sits one
- * level below its plugin root.
+ * Discovery is part of the unified bounded walk (P-065): the file
+ * list comes from discoverSurfaces, with the plugin root at most
+ * PLUGIN_HOOKS_MAX_DEPTH directories below the scan root (the hooks
+ * directory itself sits one level below its plugin root), and the
+ * same cap with a warning applies.
  */
-export const PLUGIN_HOOKS_MAX_DEPTH = 4;
-export const PLUGIN_HOOKS_MAX_FILES = 200;
-
-function discoverPluginHookFiles(root: string, warnings: string[]): string[] {
-  const found: string[] = [];
-  const skipDirs = new Set(["node_modules", ".git"]);
-  const maxHooksDirDepth = PLUGIN_HOOKS_MAX_DEPTH + 1;
-  const stack: Array<{ abs: string; rel: string; depth: number }> = [{ abs: root, rel: "", depth: 0 }];
-  while (stack.length > 0) {
-    const cur = stack.pop() as { abs: string; rel: string; depth: number };
-    let entries: string[] = [];
-    try { entries = readdirSync(cur.abs); } catch {
-      if (cur.rel) warnings.push(`Unreadable directory skipped: ${cur.rel} could not be listed; the scan is partial`);
-      continue;
-    }
-    entries.sort();
-    const base = cur.rel === "" ? "" : (cur.rel.split("/").pop() ?? "");
-    if (cur.depth >= 1 && base === "hooks") {
-      for (const name of ["hooks.json", "hooks-cursor.json"]) {
-        if (entries.includes(name)) found.push(cur.rel === "" ? name : `${cur.rel}/${name}`);
-      }
-    }
-    if (cur.depth >= maxHooksDirDepth) continue;
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const name = entries[i];
-      if (skipDirs.has(name) || name.startsWith(".")) continue;
-      const childAbs = join(cur.abs, name);
-      let lst; try { lst = lstatSync(childAbs); } catch { continue; }
-      if (lst.isSymbolicLink() || !lst.isDirectory()) continue;
-      stack.push({ abs: childAbs, rel: cur.rel === "" ? name : `${cur.rel}/${name}`, depth: cur.depth + 1 });
-    }
+function scanPluginHooks(root: string, findings: HookFinding[], warnings: string[], state: ScanState): void {
+  let files = state.disc.pluginHookFiles;
+  if (files.length > PLUGIN_HOOKS_MAX_FILES) {
+    warnings.push(`Plugin hooks inventory capped at ${PLUGIN_HOOKS_MAX_FILES} files (${files.length} found); the remaining plugin hook files were not inventoried and the scan is partial`);
+    state.partial = true;
+    files = files.slice(0, PLUGIN_HOOKS_MAX_FILES);
   }
-  found.sort();
-  if (found.length > PLUGIN_HOOKS_MAX_FILES) {
-    warnings.push(`Plugin hooks inventory capped at ${PLUGIN_HOOKS_MAX_FILES} files (${found.length} found); the remaining plugin hook files were not inventoried and the scan is partial`);
-    return found.slice(0, PLUGIN_HOOKS_MAX_FILES);
-  }
-  return found;
-}
-
-function scanPluginHooks(root: string, findings: HookFinding[], warnings: string[]): void {
-  for (const rel of discoverPluginHookFiles(root, warnings)) {
+  for (const rel of files) {
+    state.inventoried.add(rel);
     const data = readJson(root, rel, warnings) as Record<string, unknown> | null;
     if (!data || typeof data !== "object" || Array.isArray(data)) continue;
     // The events map lives under the hooks key when one is present;
@@ -1782,153 +1897,170 @@ function scanPluginHooks(root: string, findings: HookFinding[], warnings: string
   }
 }
 
-function scanVscode(root: string, findings: HookFinding[], warnings: string[]): void {
-  const rel = ".vscode/tasks.json";
-  if (existsSync(join(root, rel))) {
-    const data = readJson(root, rel, warnings) as { tasks?: unknown } | null;
-    if (data && data.tasks !== undefined && !Array.isArray(data.tasks)) {
-      warnings.push(`tasks key in ${rel} is not an array: tasks skipped`);
-    }
-    const tasks = Array.isArray(data?.tasks) ? data.tasks : [];
-    tasks.forEach((rawTask, idx) => {
-      // Malformed entries (null, strings, numbers) are skipped, never fatal:
-      // one bad task must not hide every other surface in the repo.
-      if (!rawTask || typeof rawTask !== "object") return;
-      const task = rawTask as Record<string, unknown>;
-      const runOptions = (task.runOptions ?? {}) as Record<string, unknown>;
-      const options = (task.options ?? {}) as Record<string, unknown>;
-      const optionsRunOptions = (options.runOptions ?? {}) as Record<string, unknown>;
-      // folderOpen lives in runOptions in the standard schema, but real
-      // world files also nest it under options or put runOn on the task.
-      const runOn = runOptions.runOn ?? optionsRunOptions.runOn ?? task.runOn;
-      const isFolderOpen = runOn === "folderOpen" || (Array.isArray(runOn) && runOn.includes("folderOpen"));
-      const command = typeof task.command === "string" ? task.command : "";
-      const args = Array.isArray(task.args) ? task.args.filter((a) => typeof a === "string").join(" ") : "";
-      const full = [command, args].filter(Boolean).join(" ").trim();
-      if (!full) return;
-      const label = typeof task.label === "string" ? task.label : `task-${idx}`;
-      if (isFolderOpen) {
-        findings.push(makeFinding(root, rel, "vscode-tasks", `folderOpen:${label}`, full, String(idx)));
-      } else {
-        // Inventory non auto-run tasks at lower weight: still record them so
-        // explain can find them, classified by their command.
-        const f = makeFinding(root, rel, "vscode-tasks", label, full, String(idx));
-        findings.push(f);
+function scanVscode(root: string, findings: HookFinding[], warnings: string[], state: ScanState): void {
+  for (const prefix of state.disc.projectRoots) {
+    const base = prefix === "" ? "" : `${prefix}/`;
+    const baseAbs = prefix === "" ? root : join(root, prefix);
+    const rel = `${base}.vscode/tasks.json`;
+    if (existsSync(join(root, rel)) && claimFile(state, "tasks", rel, prefix !== "")) {
+      const data = readJson(root, rel, warnings) as { tasks?: unknown } | null;
+      if (data && data.tasks !== undefined && !Array.isArray(data.tasks)) {
+        warnings.push(`tasks key in ${rel} is not an array: tasks skipped`);
       }
-    });
-  }
-  // MCP config inside .vscode
-  scanMcpFile(root, ".vscode/mcp.json", findings, warnings);
-}
-
-function scanDirFiles(root: string, dirRel: string, source: HookSource, findings: HookFinding[], warnings: string[]): void {
-  const abs = join(root, dirRel);
-  if (!existsSync(abs)) return;
-  let entries: string[] = [];
-  try { entries = readdirSync(abs); } catch {
-    warnings.push(`Unreadable directory skipped: ${dirRel} could not be listed; the scan is partial`);
-    return;
-  }
-  for (const name of entries.sort()) {
-    const fileAbs = join(abs, name);
-    let st; try { st = statSync(fileAbs); } catch { continue; }
-    if (!st.isFile()) continue;
-    if (name === "_" || name.startsWith(".")) continue;
-    const content = readTextWarn(fileAbs, `${dirRel}/${name}`, warnings);
-    if (content === null) continue;
-    const firstMeaningful = content.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#") && !l.startsWith("set -")).join(" ");
-    const fileRel = `${dirRel}/${name}`;
-    // Entire file content is the command surface for husky style hooks.
-    // Classify generously deep into the file: a payload hidden behind
-    // padding must still be seen. Display code truncates separately.
-    findings.push(makeFinding(root, fileRel, source, name, content.trim().slice(0, 200000)));
-    void firstMeaningful;
-  }
-}
-
-function scanLefthook(root: string, findings: HookFinding[], warnings: string[]): void {
-  for (const rel of ["lefthook.yml", "lefthook.yaml", ".lefthook.yml"]) {
-    if (!existsSync(join(root, rel))) continue;
-    const raw = (readTextWarn(join(root, rel), rel, warnings) ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    const runRe = /^\s*run:\s*(.+)$/gm;
-    let m: RegExpExecArray | null; let i = 0;
-    while ((m = runRe.exec(raw)) !== null) {
-      findings.push(makeFinding(root, rel, "lefthook", "run", m[1].trim().replace(/^["']|["']$/g, ""), String(i++)));
+      const tasks = Array.isArray(data?.tasks) ? data.tasks : [];
+      tasks.forEach((rawTask, idx) => {
+        // Malformed entries (null, strings, numbers) are skipped, never fatal:
+        // one bad task must not hide every other surface in the repo.
+        if (!rawTask || typeof rawTask !== "object") return;
+        const task = rawTask as Record<string, unknown>;
+        const runOptions = (task.runOptions ?? {}) as Record<string, unknown>;
+        const options = (task.options ?? {}) as Record<string, unknown>;
+        const optionsRunOptions = (options.runOptions ?? {}) as Record<string, unknown>;
+        // folderOpen lives in runOptions in the standard schema, but real
+        // world files also nest it under options or put runOn on the task.
+        const runOn = runOptions.runOn ?? optionsRunOptions.runOn ?? task.runOn;
+        const isFolderOpen = runOn === "folderOpen" || (Array.isArray(runOn) && runOn.includes("folderOpen"));
+        const command = typeof task.command === "string" ? task.command : "";
+        const args = Array.isArray(task.args) ? task.args.filter((a) => typeof a === "string").join(" ") : "";
+        const full = [command, args].filter(Boolean).join(" ").trim();
+        if (!full) return;
+        const label = typeof task.label === "string" ? task.label : `task-${idx}`;
+        findings.push(makeFinding(root, rel, "vscode-tasks", isFolderOpen ? `folderOpen:${label}` : label, full, String(idx), undefined, baseAbs));
+      });
     }
+    // MCP config inside .vscode
+    scanMcpFile(root, `${base}.vscode/mcp.json`, findings, warnings, state, baseAbs, prefix !== "");
   }
 }
 
-function scanPreCommit(root: string, findings: HookFinding[], warnings: string[]): void {
-  const rel = ".pre-commit-config.yaml";
-  if (!existsSync(join(root, rel))) return;
-  const raw = (readTextWarn(join(root, rel), rel, warnings) ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  const entryRe = /^\s*entry:\s*(.+)$/gm;
-  let m: RegExpExecArray | null; let i = 0;
-  while ((m = entryRe.exec(raw)) !== null) {
-    findings.push(makeFinding(root, rel, "pre-commit", "entry", m[1].trim().replace(/^["']|["']$/g, ""), String(i++)));
-  }
-  const repoRe = /^\s*-\s*repo:\s*(https?:\/\/\S+)$/gm;
-  while ((m = repoRe.exec(raw)) !== null) {
-    // A remote hook repo is the standard pre-commit pattern, not a finding
-    // of compromise: the URL alone is inventoried as UNKNOWN so a human can
-    // review the pinned rev. Classifying the bare URL with the command
-    // rules would verdict every normal pre-commit config COMPROMISED.
-    findings.push({
-      id: `${rel}:remote-repo:${i++}`,
-      file: rel,
-      source: "pre-commit",
-      hook: "remote-repo",
-      command: m[1].trim(),
-      classification: "UNKNOWN",
-      rules: [],
-      evidence: "remote pre-commit hook repo (standard pattern): its hooks run locally at commit time; hookcheck cannot verify remote contents, review the pinned rev",
-    });
-  }
-}
-
-function scanAgentDirs(root: string, findings: HookFinding[], warnings: string[]): void {
-  for (const [dir, source] of [[".cursor", "cursor"], [".codex", "codex"]] as Array<[string, HookSource]>) {
-    const abs = join(root, dir);
+function scanDirFiles(root: string, dirName: string, source: HookSource, family: string, findings: HookFinding[], warnings: string[], state: ScanState): void {
+  for (const prefix of state.disc.projectRoots) {
+    const dirRel = prefix === "" ? dirName : `${prefix}/${dirName}`;
+    const baseAbs = prefix === "" ? root : join(root, prefix);
+    const abs = join(root, dirRel);
     if (!existsSync(abs)) continue;
     let entries: string[] = [];
-    try { entries = readdirSync(abs); } catch { continue; }
+    try { entries = readdirSync(abs); } catch {
+      warnings.push(`Unreadable directory skipped: ${dirRel} could not be listed; the scan is partial`);
+      continue;
+    }
     for (const name of entries.sort()) {
       const fileAbs = join(abs, name);
       let st; try { st = statSync(fileAbs); } catch { continue; }
       if (!st.isFile()) continue;
-      const rel = `${dir}/${name}`;
-      // mcp.json is an MCP config surface, inventoried exactly once by
-      // the central scanMcpFile pass in scanHooks (P-035). Running it
-      // through the generic command walk here as well counted every
-      // .cursor/mcp.json server twice.
-      if (name === "mcp.json") continue;
-      if (name.endsWith(".json")) {
-        const data = readJson(root, rel, warnings);
-        if (data) collectGenericCommands(data, rel, root, findings, source);
-      } else {
-        const content = readTextWarn(fileAbs, rel, warnings);
-        if (content && content.trim()) {
-          findings.push(makeFinding(root, rel, source, name, content.trim().slice(0, 200000)));
+      if (name === "_" || name.startsWith(".")) continue;
+      const fileRel = `${dirRel}/${name}`;
+      if (!claimFile(state, family, fileRel, prefix !== "")) continue;
+      const content = readTextWarn(fileAbs, fileRel, warnings);
+      if (content === null) continue;
+      // Entire file content is the command surface for husky style hooks.
+      // Classify generously deep into the file: a payload hidden behind
+      // padding must still be seen. Display code truncates separately.
+      findings.push(makeFinding(root, fileRel, source, name, content.trim().slice(0, 200000), undefined, undefined, baseAbs));
+    }
+  }
+}
+
+function scanLefthook(root: string, findings: HookFinding[], warnings: string[], state: ScanState): void {
+  for (const prefix of state.disc.projectRoots) {
+    const base = prefix === "" ? "" : `${prefix}/`;
+    const baseAbs = prefix === "" ? root : join(root, prefix);
+    for (const name of ["lefthook.yml", "lefthook.yaml", ".lefthook.yml"]) {
+      const rel = `${base}${name}`;
+      if (!existsSync(join(root, rel))) continue;
+      if (!claimFile(state, "lefthook", rel, prefix !== "")) continue;
+      const raw = (readTextWarn(join(root, rel), rel, warnings) ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      const runRe = /^\s*run:\s*(.+)$/gm;
+      let m: RegExpExecArray | null; let i = 0;
+      while ((m = runRe.exec(raw)) !== null) {
+        findings.push(makeFinding(root, rel, "lefthook", "run", m[1].trim().replace(/^["']|["']$/g, ""), String(i++), undefined, baseAbs));
+      }
+    }
+  }
+}
+
+function scanPreCommit(root: string, findings: HookFinding[], warnings: string[], state: ScanState): void {
+  for (const prefix of state.disc.projectRoots) {
+    const base = prefix === "" ? "" : `${prefix}/`;
+    const baseAbs = prefix === "" ? root : join(root, prefix);
+    const rel = `${base}.pre-commit-config.yaml`;
+    if (!existsSync(join(root, rel))) continue;
+    if (!claimFile(state, "pre-commit", rel, prefix !== "")) continue;
+    const raw = (readTextWarn(join(root, rel), rel, warnings) ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const entryRe = /^\s*entry:\s*(.+)$/gm;
+    let m: RegExpExecArray | null; let i = 0;
+    while ((m = entryRe.exec(raw)) !== null) {
+      findings.push(makeFinding(root, rel, "pre-commit", "entry", m[1].trim().replace(/^["']|["']$/g, ""), String(i++), undefined, baseAbs));
+    }
+    const repoRe = /^\s*-\s*repo:\s*(https?:\/\/\S+)$/gm;
+    while ((m = repoRe.exec(raw)) !== null) {
+      // A remote hook repo is the standard pre-commit pattern, not a finding
+      // of compromise: the URL alone is inventoried as UNKNOWN so a human can
+      // review the pinned rev. Classifying the bare URL with the command
+      // rules would verdict every normal pre-commit config COMPROMISED.
+      findings.push({
+        id: `${rel}:remote-repo:${i++}`,
+        file: rel,
+        source: "pre-commit",
+        hook: "remote-repo",
+        command: m[1].trim(),
+        classification: "UNKNOWN",
+        rules: [],
+        evidence: "remote pre-commit hook repo (standard pattern): its hooks run locally at commit time; hookcheck cannot verify remote contents, review the pinned rev",
+      });
+    }
+  }
+}
+
+function scanAgentDirs(root: string, findings: HookFinding[], warnings: string[], state: ScanState): void {
+  for (const prefix of state.disc.projectRoots) {
+    const base = prefix === "" ? "" : `${prefix}/`;
+    const baseAbs = prefix === "" ? root : join(root, prefix);
+    for (const [dir, source] of [[".cursor", "cursor"], [".codex", "codex"]] as Array<[string, HookSource]>) {
+      const abs = join(root, base, dir);
+      if (!existsSync(abs)) continue;
+      let entries: string[] = [];
+      try { entries = readdirSync(abs); } catch { continue; }
+      for (const name of entries.sort()) {
+        const fileAbs = join(abs, name);
+        let st; try { st = statSync(fileAbs); } catch { continue; }
+        if (!st.isFile()) continue;
+        const rel = `${base}${dir}/${name}`;
+        // mcp.json is an MCP config surface, inventoried exactly once by
+        // the central scanMcpFile pass in scanHooks (P-035). Running it
+        // through the generic command walk here as well counted every
+        // .cursor/mcp.json server twice.
+        if (name === "mcp.json") continue;
+        if (!claimFile(state, "agent", rel, prefix !== "")) continue;
+        if (name.endsWith(".json")) {
+          const data = readJson(root, rel, warnings);
+          if (data) collectGenericCommands(data, rel, root, findings, source, "", baseAbs);
+        } else {
+          const content = readTextWarn(fileAbs, rel, warnings);
+          if (content && content.trim()) {
+            findings.push(makeFinding(root, rel, source, name, content.trim().slice(0, 200000), undefined, undefined, baseAbs));
+          }
         }
       }
     }
   }
 }
 
-function collectGenericCommands(node: unknown, file: string, root: string, findings: HookFinding[], source: HookSource, prefix = ""): void {
+function collectGenericCommands(node: unknown, file: string, root: string, findings: HookFinding[], source: HookSource, prefix = "", baseAbs: string = root): void {
   if (!node || typeof node !== "object") return;
   const obj = node as Record<string, unknown>;
   if (typeof obj.command === "string" && obj.command.trim()) {
     const args = Array.isArray(obj.args) ? obj.args.filter((a) => typeof a === "string").join(" ") : "";
-    findings.push(makeFinding(root, file, source, prefix || "command", [obj.command, args].filter(Boolean).join(" "), String(findings.length)));
+    findings.push(makeFinding(root, file, source, prefix || "command", [obj.command, args].filter(Boolean).join(" "), String(findings.length), undefined, baseAbs));
   }
   for (const [key, value] of Object.entries(obj)) {
-    if (value && typeof value === "object") collectGenericCommands(value, file, root, findings, source, prefix ? `${prefix}:${key}` : key);
+    if (value && typeof value === "object") collectGenericCommands(value, file, root, findings, source, prefix ? `${prefix}:${key}` : key, baseAbs);
   }
 }
 
-function scanMcpFile(root: string, rel: string, findings: HookFinding[], warnings: string[]): void {
+function scanMcpFile(root: string, rel: string, findings: HookFinding[], warnings: string[], state: ScanState, baseAbs: string, isNested: boolean): void {
   if (!existsSync(join(root, rel))) return;
+  if (!claimFile(state, "mcp", rel, isNested)) return;
   const data = readJson(root, rel, warnings) as Record<string, unknown> | null;
   if (!data) return;
   const servers = (data.mcpServers ?? data.servers ?? {}) as Record<string, unknown>;
@@ -1939,9 +2071,9 @@ function scanMcpFile(root: string, rel: string, findings: HookFinding[], warning
     const command = typeof c.command === "string" ? c.command : "";
     const args = Array.isArray(c.args) ? c.args.filter((a) => typeof a === "string").join(" ") : "";
     const full = [command, args].filter(Boolean).join(" ").trim();
-    if (full) findings.push(makeFinding(root, rel, "mcp-config", `mcp:${name}`, full));
+    if (full) findings.push(makeFinding(root, rel, "mcp-config", `mcp:${name}`, full, undefined, undefined, baseAbs));
     if (typeof c.url === "string" && c.url) {
-      findings.push(makeFinding(root, rel, "mcp-config", `mcp:${name}:url`, c.url));
+      findings.push(makeFinding(root, rel, "mcp-config", `mcp:${name}:url`, c.url, undefined, undefined, baseAbs));
     }
   }
 }
@@ -1970,20 +2102,31 @@ function scanMcpFile(root: string, rel: string, findings: HookFinding[], warning
  * resolved is still inventoried, as the literal alias text at UNKNOWN,
  * so no executable step ever yields zero findings.
  */
-function scanWorkflows(root: string, findings: HookFinding[], warnings: string[]): void {
-  const dir = ".github/workflows";
-  const abs = join(root, dir);
-  if (!existsSync(abs)) return;
-  let entries: string[] = [];
-  try { entries = readdirSync(abs); } catch {
-    warnings.push(`Unreadable directory skipped: ${dir} could not be listed; the scan is partial`);
-    return;
+function scanWorkflows(root: string, findings: HookFinding[], warnings: string[], state: ScanState): void {
+  for (const prefix of state.disc.projectRoots) {
+    const base = prefix === "" ? "" : `${prefix}/`;
+    const baseAbs = prefix === "" ? root : join(root, prefix);
+    const dir = `${base}.github/workflows`;
+    const abs = join(root, dir);
+    if (!existsSync(abs)) continue;
+    let entries: string[] = [];
+    try { entries = readdirSync(abs); } catch {
+      warnings.push(`Unreadable directory skipped: ${dir} could not be listed; the scan is partial`);
+      continue;
+    }
+    for (const name of entries.sort()) {
+      if (!/\.(yml|yaml)$/.test(name)) continue;
+      const rel = `${dir}/${name}`;
+      if (!claimFile(state, "workflows", rel, prefix !== "")) continue;
+      scanOneWorkflow(root, rel, baseAbs, findings, warnings);
+    }
   }
-  for (const name of entries.sort()) {
-    if (!/\.(yml|yaml)$/.test(name)) continue;
-    const rel = `${dir}/${name}`;
+}
+
+function scanOneWorkflow(root: string, rel: string, baseAbs: string, findings: HookFinding[], warnings: string[]): void {
+  {
     const rawFile = readTextWarn(join(root, rel), rel, warnings);
-    if (rawFile === null) continue;
+    if (rawFile === null) return;
     const raw = rawFile.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     const lines = raw.split("\n");
     const indentOf = (l: string): number => l.length - l.trimStart().length;
@@ -2065,14 +2208,14 @@ function scanWorkflows(root: string, findings: HookFinding[], warnings: string[]
       if (aliasStep) {
         const name = aliasStep[1];
         const resolved = scalarAnchors.has(name) || mapAnchors.has(name) ? resolveAlias(`*${name}`) : `*${name}`;
-        findings.push(makeFinding(root, rel, "github-workflow", "run", resolved, String(i++), lineNo));
+        findings.push(makeFinding(root, rel, "github-workflow", "run", resolved, String(i++), lineNo, baseAbs));
         continue;
       }
       const mergeKey = line.match(/^\s*<<:\s*\*([A-Za-z0-9_-]+)\s*(#.*)?$/);
       if (mergeKey) {
         const name = mergeKey[1];
         const resolved = scalarAnchors.has(name) || mapAnchors.has(name) ? resolveAlias(`*${name}`) : `*${name}`;
-        findings.push(makeFinding(root, rel, "github-workflow", "run", resolved, String(i++), lineNo));
+        findings.push(makeFinding(root, rel, "github-workflow", "run", resolved, String(i++), lineNo, baseAbs));
         continue;
       }
       const m = line.match(/^(\s*)-?\s*run:\s*(.*)$/);
@@ -2093,19 +2236,19 @@ function scanWorkflows(root: string, findings: HookFinding[], warnings: string[]
       if (blockHeader) {
         const { body, end } = collectBlock(idx, runIndent);
         if (body) {
-          findings.push(makeFinding(root, rel, "github-workflow", "run", body, String(i++), lineNoRun));
+          findings.push(makeFinding(root, rel, "github-workflow", "run", body, String(i++), lineNoRun, baseAbs));
         }
         idx = end - 1;
         continue;
       }
       if (rest === "") continue;
-      findings.push(makeFinding(root, rel, "github-workflow", "run", rest, String(i++), lineNoRun));
+      findings.push(makeFinding(root, rel, "github-workflow", "run", rest, String(i++), lineNoRun, baseAbs));
     }
   }
 }
 
-function scanGitHooks(root: string, findings: HookFinding[], warnings: string[]): void {
-  scanDirFiles(root, ".githooks", "githooks", findings, warnings);
+function scanGitHooks(root: string, findings: HookFinding[], warnings: string[], state: ScanState): void {
+  scanDirFiles(root, ".githooks", "githooks", "githooks", findings, warnings, state);
 }
 
 /**
@@ -2139,20 +2282,45 @@ export function scanHooks(root: string): ScanReport {
       note: EMPTY_ESTATE_NOTE,
     };
   }
-  scanPackageJson(root, findings, warnings);
-  scanClaude(root, findings, warnings);
-  scanPluginHooks(root, findings, warnings);
-  scanVscode(root, findings, warnings);
-  scanDirFiles(root, ".husky", "husky", findings, warnings);
-  scanLefthook(root, findings, warnings);
-  scanPreCommit(root, findings, warnings);
-  scanAgentDirs(root, findings, warnings);
-  // MCP config surfaces, each inventoried exactly once (P-035).
+  const disc = discoverSurfaces(root, warnings);
+  const state: ScanState = { disc, inventoried: new Set<string>(), familyFound: new Map(), familyCapped: new Map(), partial: false };
+  scanPackageJson(root, findings, warnings, state);
+  scanClaude(root, findings, warnings, state);
+  scanPluginHooks(root, findings, warnings, state);
+  scanVscode(root, findings, warnings, state);
+  scanDirFiles(root, ".husky", "husky", "husky", findings, warnings, state);
+  scanLefthook(root, findings, warnings, state);
+  scanPreCommit(root, findings, warnings, state);
+  scanAgentDirs(root, findings, warnings, state);
+  // MCP config surfaces, each inventoried exactly once (P-035), at the
+  // scan root and at every nested project root (P-065).
   // .windsurf/mcp.json joined the covered surfaces in v0.1.6 (P-034);
   // .vscode/mcp.json is handled inside scanVscode.
-  for (const rel of [".mcp.json", "mcp.json", ".cursor/mcp.json", ".windsurf/mcp.json", ".codex/mcp.json"]) scanMcpFile(root, rel, findings, warnings);
-  scanWorkflows(root, findings, warnings);
-  scanGitHooks(root, findings, warnings);
+  for (const prefix of disc.projectRoots) {
+    const base = prefix === "" ? "" : `${prefix}/`;
+    const baseAbs = prefix === "" ? root : join(root, prefix);
+    for (const name of [".mcp.json", "mcp.json", ".cursor/mcp.json", ".windsurf/mcp.json", ".codex/mcp.json"]) {
+      scanMcpFile(root, `${base}${name}`, findings, warnings, state, baseAbs, prefix !== "");
+    }
+  }
+  scanWorkflows(root, findings, warnings, state);
+  scanGitHooks(root, findings, warnings, state);
+
+  // Bounded scan honesty (P-065): a scan cut short by the discovery
+  // bounds must say so, naming the bound, instead of presenting as
+  // complete. Surfaces spotted just below the depth bound are counted
+  // in the warning, never silently dropped.
+  if (disc.depthBoundHit) {
+    const below = disc.surfacesBelowBound > 0
+      ? `; at least ${disc.surfacesBelowBound} of the directories just below the bound contain hook surface files or config directories that were not inventoried`
+      : "";
+    warnings.push(`Nested discovery bounded at depth ${NESTED_MAX_DEPTH}: project directories more than ${NESTED_MAX_DEPTH} levels below the scan root were not scanned (${disc.frontierDirs} ${disc.frontierDirs === 1 ? "directory" : "directories"} below the bound not entered${below}); the scan is partial (bounded)`);
+  }
+  for (const [family, capped] of state.familyCapped) {
+    const label = FAMILY_LABELS[family] ?? family;
+    warnings.push(`Nested ${label} inventory capped at ${NESTED_MAX_FILES_PER_SURFACE} files (${state.familyFound.get(family) ?? 0} found); the remaining nested ${label} files were not inventoried and the scan is partial`);
+    void capped;
+  }
 
   // Dedupe identical ids (agent dir scan may double count mcp.json).
   const seen = new Set<string>();
@@ -2168,12 +2336,14 @@ export function scanHooks(root: string): ScanReport {
     risky: deduped.filter((f) => f.classification === "RISKY").length,
     unknown: deduped.filter((f) => f.classification === "UNKNOWN").length,
   };
-  // Partial scan floor (P-049): when any inventoried file or directory
-  // could not be read, the scan did not see the whole estate, so a bare
-  // CLEAN is not an honest verdict. Floor at REVIEW; the warnings name
-  // exactly what was missed.
+  // Partial scan floor (P-049, extended by P-065): when any inventoried
+  // file or directory could not be read, when a file cap left surface
+  // files uninventoried, or when hook surfaces were spotted just below
+  // the discovery depth bound, the scan did not see the whole estate,
+  // so a bare CLEAN is not an honest verdict. Floor at REVIEW; the
+  // warnings name exactly what was missed.
   let verdict = computeVerdict(deduped);
-  if (verdict === "CLEAN" && warnings.some((w) => w.startsWith("Unreadable"))) {
+  if (verdict === "CLEAN" && (warnings.some((w) => w.startsWith("Unreadable")) || state.partial || disc.surfacesBelowBound > 0)) {
     verdict = "REVIEW";
   }
   return {
