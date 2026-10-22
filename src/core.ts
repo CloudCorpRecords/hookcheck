@@ -4,11 +4,11 @@
  * No network, no LLM. Every classification comes from explicit pattern
  * rules so the same repo always produces the same report.
  */
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative, resolve, sep } from "node:path";
+import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import type { Classification, HookFinding, HookSource, ScanReport, Verdict } from "./types.js";
 
-export const VERSION = "0.1.5";
+export const VERSION = "0.1.6";
 
 interface RuleDef {
   id: string;
@@ -878,23 +878,84 @@ export function classifyCommand(command: string, lang: Lang = "shell"): { classi
   return { classification: "UNKNOWN", rules: [], evidence: "no known safe pattern and no risky pattern matched; manual review needed" };
 }
 
+const SCRIPT_TOKEN_RE = /[A-Za-z0-9_.\/-]+\.(?:mjs|cjs|js|ts|sh|py)\b/g;
+
+/**
+ * Second hop detection (P-031). The one hop limit means a payload two
+ * files deep is never read, and that limit is documented. What was not
+ * acceptable was the chain head classifying SAFE on the strength of its
+ * own command text (`node scripts/a.js` matches a safe dev pattern)
+ * while its target's whole job is spawning a further local script the
+ * scanner cannot see: SAFE is an affirmative statement, and the README
+ * floor for chains beyond the follower is UNKNOWN or REVIEW. This
+ * detector returns the local script tokens that `content` EXECUTES:
+ * script tokens inside exec style call spans (execSync, spawn, Popen,
+ * os.system, and friends), and interpreter invocations (`node x.js`,
+ * `bash x.sh`) appearing as command text. Spawning a plain binary
+ * (spawn('esbuild', ...)) executes no local script and does not count,
+ * and a mere require or mention of a file is not a spawn.
+ */
+function secondHopScripts(scanRootAbs: string, baseAbs: string, content: string, selfAbs: string): string[] {
+  const text = stripComments(content);
+  const found = new Set<string>();
+  const collectFrom = (segText: string): void => {
+    for (const tok of segText.match(SCRIPT_TOKEN_RE) ?? []) found.add(tok);
+  };
+  // Exec style call spans: everything up to the matching close paren.
+  const callRe = /\b(?:execSync|execFileSync|execSync|execFile|spawnSync|spawn|exec|system|popen|Popen|runInThisContext|runInNewContext)\s*\(/g;
+  let cm: RegExpExecArray | null;
+  while ((cm = callRe.exec(text)) !== null) {
+    const span = callSpan(text, cm.index + cm[0].length - 1);
+    collectFrom(text.slice(span.start, span.end));
+  }
+  // Interpreter invocations written as command text anywhere (shell
+  // lines, command strings outside the calls above).
+  const interpRe = /(?:^|[\s'"`(;|&])(?:node|bash|sh|zsh|python3?|perl|ruby)\s+(?:\.\/)?([A-Za-z0-9_.\/-]+\.(?:mjs|cjs|js|ts|sh|py))\b/gm;
+  let im: RegExpExecArray | null;
+  while ((im = interpRe.exec(text)) !== null) found.add(im[1]);
+  const out: string[] = [];
+  for (const tok of found) {
+    const rel = tok.replace(/^\.\//, "");
+    if (rel.includes("://")) continue;
+    for (const base of [baseAbs, scanRootAbs]) {
+      const abs = resolve(base, rel);
+      if (abs === selfAbs) continue;
+      if (abs !== scanRootAbs && !abs.startsWith(scanRootAbs + sep)) continue;
+      let st; try { st = statSync(abs); } catch { continue; }
+      if (st.isFile()) { out.push(rel); break; }
+    }
+  }
+  return out;
+}
+
 /**
  * If a command references local script files, inspect those files for risky
  * patterns too (one hop). References are found by token, not only after an
  * interpreter name, so `node setup.mjs`, `./setup.sh`, `node --require
  * ./setup.mjs`, and `bash setup.sh` all resolve. References that escape the
- * scanned root are never followed.
+ * scanned root are never followed. Local references resolve against
+ * baseAbs first (the directory of the file that carries the hook, which
+ * matters for nested package.json files) and then against the scan root.
+ *
+ * P-031 floor: when a referenced file is not itself RISKY but spawns a
+ * further local script, the chain continues past the one hop limit, so a
+ * SAFE classification is floored to UNKNOWN with the second hop named in
+ * the evidence. The payload at hop two stays unclassified (the limit),
+ * but the head can no longer be affirmatively cleared.
  */
-function escalateWithLocalFile(root: string, finding: HookFinding): HookFinding {
-  const tokenRe = /[A-Za-z0-9_.\/-]+\.(?:mjs|cjs|js|ts|sh|py)\b/g;
-  const tokens = Array.from(new Set(finding.command.match(tokenRe) ?? [])).slice(0, 5);
+function escalateWithLocalFile(root: string, finding: HookFinding, baseAbs: string = root): HookFinding {
+  const tokens = Array.from(new Set(finding.command.match(SCRIPT_TOKEN_RE) ?? [])).slice(0, 5);
   if (tokens.length === 0) return finding;
   const rootAbs = resolve(root);
+  const baseResolved = resolve(baseAbs);
   let out = finding;
   for (const token of tokens) {
     const rel = token.replace(/^\.\//, "");
     if (rel.includes("://")) continue;
-    const abs = resolve(rootAbs, rel);
+    let abs = resolve(baseResolved, rel);
+    if ((abs !== rootAbs && !abs.startsWith(rootAbs + sep)) || !existsSync(abs)) {
+      abs = resolve(rootAbs, rel);
+    }
     if (abs !== rootAbs && !abs.startsWith(rootAbs + sep)) continue;
     if (!existsSync(abs)) continue;
     let st; try { st = statSync(abs); } catch { continue; }
@@ -910,16 +971,26 @@ function escalateWithLocalFile(root: string, finding: HookFinding): HookFinding 
         rules,
         evidence: `${out.evidence === "" ? "" : out.evidence + "; "}referenced local file ${rel} is RISKY: ${inner.evidence}`,
       };
+      continue;
+    }
+    const hops = secondHopScripts(rootAbs, dirname(abs), content, abs);
+    if (hops.length > 0) {
+      const note = `referenced local file ${rel} spawns further local script(s) ${hops.join(", ")} beyond the one hop limit; the chain head cannot be verified past hop one`;
+      out = {
+        ...out,
+        classification: out.classification === "SAFE" ? "UNKNOWN" : out.classification,
+        evidence: `${out.evidence === "" ? "" : out.evidence + "; "}${note}; classification floored at UNKNOWN`,
+      };
     }
   }
   return out;
 }
 
 /** Classify a command string, including one hop into local files it runs. */
-function classifyWithLocalFile(root: string, source: HookSource, command: string): { classification: Classification; rules: string[]; evidence: string } {
+function classifyWithLocalFile(root: string, source: HookSource, command: string, baseAbs: string = root): { classification: Classification; rules: string[]; evidence: string } {
   const c = classifyCommand(command);
   const temp: HookFinding = { id: "", file: "", source, hook: "", command, classification: c.classification, rules: c.rules, evidence: c.evidence };
-  const escalated = escalateWithLocalFile(root, temp);
+  const escalated = escalateWithLocalFile(root, temp, baseAbs);
   return { classification: escalated.classification, rules: escalated.rules, evidence: escalated.evidence };
 }
 
@@ -929,7 +1000,7 @@ function classifyWithLocalFile(root: string, source: HookSource, command: string
  * script is RISKY (directly or through a local file it runs), the install
  * hook inherits the classification.
  */
-function escalateWithScriptChain(root: string, scripts: Record<string, unknown>, currentName: string, finding: HookFinding): HookFinding {
+function escalateWithScriptChain(root: string, scripts: Record<string, unknown>, currentName: string, finding: HookFinding, baseAbs: string = root): HookFinding {
   const chainRe = /\b(?:npm|yarn|pnpm|bun)\s+(?:run\s+)?([A-Za-z0-9:_-]+)/g;
   let out = finding;
   let m: RegExpExecArray | null;
@@ -938,7 +1009,7 @@ function escalateWithScriptChain(root: string, scripts: Record<string, unknown>,
     if (name === currentName) continue;
     const chained = scripts[name];
     if (typeof chained !== "string" || !chained.trim()) continue;
-    const inner = classifyWithLocalFile(root, "package.json", chained);
+    const inner = classifyWithLocalFile(root, "package.json", chained, baseAbs);
     if (inner.classification === "RISKY") {
       const rules = Array.from(new Set([...out.rules, ...inner.rules]));
       out = {
@@ -990,7 +1061,7 @@ export function computeVerdict(findings: HookFinding[]): Verdict {
   return review ? "REVIEW" : "CLEAN";
 }
 
-function makeFinding(root: string, file: string, source: HookSource, hook: string, command: string, idSuffix?: string, line?: number): HookFinding {
+function makeFinding(root: string, file: string, source: HookSource, hook: string, command: string, idSuffix?: string, line?: number, baseAbs: string = root): HookFinding {
   const c = classifyCommand(command);
   const id = `${file}:${hook}${idSuffix !== undefined ? `:${idSuffix}` : ""}`;
   const base: HookFinding = {
@@ -999,15 +1070,31 @@ function makeFinding(root: string, file: string, source: HookSource, hook: strin
     classification: c.classification, rules: c.rules,
     evidence: c.evidence,
   };
-  return escalateWithLocalFile(root, base);
+  return escalateWithLocalFile(root, base, baseAbs);
 }
 
 function readText(abs: string): string | null {
   try { return readFileSync(abs, "utf8"); } catch { return null; }
 }
 
+/**
+ * Read a file the scanner has decided to inventory, warning loudly when
+ * it cannot be read (P-049). A file that exists but cannot be read (the
+ * classic case is mode 000) must never vanish silently: the warning
+ * names the file, and scanHooks floors the verdict at REVIEW whenever
+ * any warning carries the Unreadable prefix, so a partial scan never
+ * presents as a complete all-clear.
+ */
+function readTextWarn(abs: string, rel: string, warnings: string[]): string | null {
+  try { return readFileSync(abs, "utf8"); } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code ?? "error";
+    warnings.push(`Unreadable file skipped: ${rel} could not be read (${code}); the scan is partial and this file was not inventoried`);
+    return null;
+  }
+}
+
 function readJson(root: string, rel: string, warnings: string[]): unknown | null {
-  const raw = readText(join(root, rel));
+  const raw = readTextWarn(join(root, rel), rel, warnings);
   if (raw === null) return null;
   // Strip a UTF-8 BOM first: Windows editors add one, JSON.parse rejects it,
   // and skipping the file would hide every hook inside it.
@@ -1022,13 +1109,12 @@ function readJson(root: string, rel: string, warnings: string[]): unknown | null
   }
 }
 
-function scanPackageJson(root: string, findings: HookFinding[], warnings: string[]): void {
-  const rel = "package.json";
+function scanOnePackageJson(root: string, rel: string, findings: HookFinding[], warnings: string[]): void {
   if (!existsSync(join(root, rel))) return;
   const data = readJson(root, rel, warnings) as { scripts?: Record<string, unknown> } | null;
   if (!data) {
-    // readJson already warned when the file exists but is malformed. If it
-    // parsed to a non object, note it as well.
+    // readJson already warned when the file exists but is malformed or
+    // unreadable. If it parsed to a non object, note it as well.
     if (readText(join(root, rel)) !== null && !warnings.some((w) => w.includes(rel))) {
       warnings.push(`Could not parse ${rel} as an object`);
     }
@@ -1044,12 +1130,71 @@ function scanPackageJson(root: string, findings: HookFinding[], warnings: string
   }
   const scripts = (data.scripts ?? {}) as Record<string, unknown>;
   const watched = ["preinstall", "install", "postinstall", "prepare", "prepublish", "prepublishOnly"];
+  // Referenced local files resolve against this package's own directory:
+  // a nested workspace package runs its scripts from its own folder.
+  const baseAbs = dirname(join(root, rel));
   for (const name of watched) {
     const cmd = scripts[name];
     if (typeof cmd === "string" && cmd.trim()) {
-      const finding = makeFinding(root, rel, "package.json", name, cmd);
-      findings.push(escalateWithScriptChain(root, scripts, name, finding));
+      const finding = makeFinding(root, rel, "package.json", name, cmd, undefined, undefined, baseAbs);
+      findings.push(escalateWithScriptChain(root, scripts, name, finding, baseAbs));
     }
+  }
+}
+
+/**
+ * Nested package.json discovery (P-032). Install scripts in workspace
+ * subpackages (packages/foo, apps/web) run on a root install, so a
+ * root-only scan misses exactly the surface a worm would persist in.
+ * The walk is bounded so a hostile or giant tree cannot explode the
+ * report: directories are visited in sorted order to depth
+ * PACKAGE_MAX_DEPTH (the package.json directory depth below the root),
+ * node_modules, .git, and dot directories are never entered, symlinked
+ * directories are never followed (a symlink loop cannot hang the scan),
+ * and at most PACKAGE_MAX_NESTED nested files are inventoried, with the
+ * cap reported as a warning when it is hit.
+ */
+export const PACKAGE_MAX_DEPTH = 4;
+export const PACKAGE_MAX_NESTED = 200;
+
+function discoverNestedPackageJson(root: string, warnings: string[]): string[] {
+  const found: string[] = [];
+  const skipDirs = new Set(["node_modules", ".git"]);
+  const stack: Array<{ abs: string; rel: string; depth: number }> = [{ abs: root, rel: "", depth: 0 }];
+  while (stack.length > 0) {
+    const cur = stack.pop() as { abs: string; rel: string; depth: number };
+    let entries: string[] = [];
+    try { entries = readdirSync(cur.abs); } catch {
+      if (cur.rel) warnings.push(`Unreadable directory skipped: ${cur.rel} could not be listed; the scan is partial`);
+      continue;
+    }
+    entries.sort();
+    if (cur.depth >= 1 && entries.includes("package.json")) {
+      found.push(cur.rel === "" ? "package.json" : `${cur.rel}/package.json`);
+    }
+    if (cur.depth >= PACKAGE_MAX_DEPTH) continue;
+    // Push in reverse so the stack pops in sorted order.
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const name = entries[i];
+      if (skipDirs.has(name) || name.startsWith(".")) continue;
+      const childAbs = join(cur.abs, name);
+      let lst; try { lst = lstatSync(childAbs); } catch { continue; }
+      if (lst.isSymbolicLink() || !lst.isDirectory()) continue;
+      stack.push({ abs: childAbs, rel: cur.rel === "" ? name : `${cur.rel}/${name}`, depth: cur.depth + 1 });
+    }
+  }
+  found.sort();
+  if (found.length > PACKAGE_MAX_NESTED) {
+    warnings.push(`Nested package.json inventory capped at ${PACKAGE_MAX_NESTED} files (${found.length} found); the remaining nested package.json files were not inventoried and the scan is partial`);
+    return found.slice(0, PACKAGE_MAX_NESTED);
+  }
+  return found;
+}
+
+function scanPackageJson(root: string, findings: HookFinding[], warnings: string[]): void {
+  scanOnePackageJson(root, "package.json", findings, warnings);
+  for (const rel of discoverNestedPackageJson(root, warnings)) {
+    scanOnePackageJson(root, rel, findings, warnings);
   }
 }
 
@@ -1155,17 +1300,20 @@ function scanVscode(root: string, findings: HookFinding[], warnings: string[]): 
   scanMcpFile(root, ".vscode/mcp.json", findings, warnings);
 }
 
-function scanDirFiles(root: string, dirRel: string, source: HookSource, findings: HookFinding[]): void {
+function scanDirFiles(root: string, dirRel: string, source: HookSource, findings: HookFinding[], warnings: string[]): void {
   const abs = join(root, dirRel);
   if (!existsSync(abs)) return;
   let entries: string[] = [];
-  try { entries = readdirSync(abs); } catch { return; }
+  try { entries = readdirSync(abs); } catch {
+    warnings.push(`Unreadable directory skipped: ${dirRel} could not be listed; the scan is partial`);
+    return;
+  }
   for (const name of entries.sort()) {
     const fileAbs = join(abs, name);
     let st; try { st = statSync(fileAbs); } catch { continue; }
     if (!st.isFile()) continue;
     if (name === "_" || name.startsWith(".")) continue;
-    const content = readText(fileAbs);
+    const content = readTextWarn(fileAbs, `${dirRel}/${name}`, warnings);
     if (content === null) continue;
     const firstMeaningful = content.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#") && !l.startsWith("set -")).join(" ");
     const fileRel = `${dirRel}/${name}`;
@@ -1177,10 +1325,10 @@ function scanDirFiles(root: string, dirRel: string, source: HookSource, findings
   }
 }
 
-function scanLefthook(root: string, findings: HookFinding[]): void {
+function scanLefthook(root: string, findings: HookFinding[], warnings: string[]): void {
   for (const rel of ["lefthook.yml", "lefthook.yaml", ".lefthook.yml"]) {
     if (!existsSync(join(root, rel))) continue;
-    const raw = readText(join(root, rel)) ?? "";
+    const raw = (readTextWarn(join(root, rel), rel, warnings) ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     const runRe = /^\s*run:\s*(.+)$/gm;
     let m: RegExpExecArray | null; let i = 0;
     while ((m = runRe.exec(raw)) !== null) {
@@ -1189,10 +1337,10 @@ function scanLefthook(root: string, findings: HookFinding[]): void {
   }
 }
 
-function scanPreCommit(root: string, findings: HookFinding[]): void {
+function scanPreCommit(root: string, findings: HookFinding[], warnings: string[]): void {
   const rel = ".pre-commit-config.yaml";
   if (!existsSync(join(root, rel))) return;
-  const raw = readText(join(root, rel)) ?? "";
+  const raw = (readTextWarn(join(root, rel), rel, warnings) ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const entryRe = /^\s*entry:\s*(.+)$/gm;
   let m: RegExpExecArray | null; let i = 0;
   while ((m = entryRe.exec(raw)) !== null) {
@@ -1228,16 +1376,20 @@ function scanAgentDirs(root: string, findings: HookFinding[], warnings: string[]
       let st; try { st = statSync(fileAbs); } catch { continue; }
       if (!st.isFile()) continue;
       const rel = `${dir}/${name}`;
+      // mcp.json is an MCP config surface, inventoried exactly once by
+      // the central scanMcpFile pass in scanHooks (P-035). Running it
+      // through the generic command walk here as well counted every
+      // .cursor/mcp.json server twice.
+      if (name === "mcp.json") continue;
       if (name.endsWith(".json")) {
         const data = readJson(root, rel, warnings);
         if (data) collectGenericCommands(data, rel, root, findings, source);
       } else {
-        const content = readText(fileAbs);
+        const content = readTextWarn(fileAbs, rel, warnings);
         if (content && content.trim()) {
           findings.push(makeFinding(root, rel, source, name, content.trim().slice(0, 200000)));
         }
       }
-      if (name === "mcp.json") scanMcpFile(root, rel, findings, warnings);
     }
   }
 }
@@ -1280,57 +1432,159 @@ function scanMcpFile(root: string, rel: string, findings: HookFinding[], warning
  * multi-line steps; their bodies are collected by indentation, dedented,
  * and classified exactly like the same commands on one line. Every
  * finding carries the 1-based line number of its run: key.
+ *
+ * Line endings are normalized before parsing (P-048): CRLF is a
+ * semantics preserving encoding for YAML and GitHub Actions, but the
+ * line parser keyed on patterns that a trailing carriage return broke,
+ * so a Windows authored workflow inventoried as total 0. A CRLF file
+ * now produces exactly the findings of its LF twin.
+ *
+ * YAML anchors defined in the same file are resolved (P-033): a scalar
+ * alias used as a run value (run: *name) resolves to the anchored
+ * scalar, a step that is only an alias (- *name) resolves to the
+ * anchored mapping's run value, and a merge key step (<<: *name) is
+ * inventoried by its resolved content. The anchored definition itself
+ * (an x- style key outside any step) is not double counted: it is
+ * inventoried at each use site instead. An alias that cannot be
+ * resolved is still inventoried, as the literal alias text at UNKNOWN,
+ * so no executable step ever yields zero findings.
  */
-function scanWorkflows(root: string, findings: HookFinding[]): void {
+function scanWorkflows(root: string, findings: HookFinding[], warnings: string[]): void {
   const dir = ".github/workflows";
   const abs = join(root, dir);
   if (!existsSync(abs)) return;
   let entries: string[] = [];
-  try { entries = readdirSync(abs); } catch { return; }
+  try { entries = readdirSync(abs); } catch {
+    warnings.push(`Unreadable directory skipped: ${dir} could not be listed; the scan is partial`);
+    return;
+  }
   for (const name of entries.sort()) {
     if (!/\.(yml|yaml)$/.test(name)) continue;
     const rel = `${dir}/${name}`;
-    const raw = readText(join(root, rel)) ?? "";
+    const rawFile = readTextWarn(join(root, rel), rel, warnings);
+    if (rawFile === null) continue;
+    const raw = rawFile.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     const lines = raw.split("\n");
-    let i = 0;
+    const indentOf = (l: string): number => l.length - l.trimStart().length;
+    const unquote = (s: string): string => {
+      const t = s.trim();
+      if (t.length >= 2 && ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'")))) return t.slice(1, -1);
+      return t;
+    };
+
+    // Anchor tables, filled by a first pass over the whole file so a
+    // use site resolves regardless of definition order.
+    const scalarAnchors = new Map<string, string>();
+    const mapAnchors = new Map<string, string>();
+    const definitionRunLines = new Set<number>();
+    const resolveAlias = (value: string, depth = 0): string => {
+      const t = value.trim();
+      const am = t.match(/^\*([A-Za-z0-9_-]+)$/);
+      if (am && depth < 5) {
+        if (scalarAnchors.has(am[1])) return resolveAlias(scalarAnchors.get(am[1]) as string, depth + 1);
+        if (mapAnchors.has(am[1])) return mapAnchors.get(am[1]) as string;
+      }
+      return unquote(t);
+    };
+    // Collect the dedented body of a block scalar whose header sits at
+    // line hdrIdx with run indent runIndent. Returns body and end index.
+    const collectBlock = (hdrIdx: number, runIndent: number): { body: string; end: number } => {
+      const body: string[] = [];
+      let j = hdrIdx + 1;
+      for (; j < lines.length; j++) {
+        const l = lines[j];
+        if (l.trim() === "") { body.push(""); continue; }
+        if (indentOf(l) <= runIndent) break;
+        body.push(l);
+      }
+      const nonBlank = body.filter((l) => l.trim() !== "");
+      if (nonBlank.length === 0) return { body: "", end: j };
+      const minIndent = Math.min(...nonBlank.map((l) => l.length - l.trimStart().length));
+      const dedented = body.map((l) => (l.trim() === "" ? "" : l.slice(minIndent))).join("\n").trim();
+      return { body: dedented, end: j };
+    };
+
     for (let idx = 0; idx < lines.length; idx++) {
-      const m = lines[idx].match(/^(\s*)-?\s*run:\s*(.*)$/);
-      if (!m) continue;
-      const runIndent = m[1].length;
-      const rest = m[2].trim();
-      const lineNo = idx + 1;
-      const blockHeader = rest.match(/^([|>])([+-]?)\s*(#.*)?$/);
-      if (blockHeader) {
-        // Collect body lines: blank lines belong to the block; the block
-        // ends at the first non-blank line indented at or below run:.
-        const body: string[] = [];
-        let j = idx + 1;
-        for (; j < lines.length; j++) {
+      const line = lines[idx];
+      const scalarM = line.match(/^(\s*)(?:-\s*)?([A-Za-z0-9_-]+):\s*&([A-Za-z0-9_-]+)\s+(.+?)\s*$/);
+      if (scalarM && scalarM[2] !== "run") {
+        scalarAnchors.set(scalarM[3], unquote(scalarM[4]));
+        continue;
+      }
+      const mapM = line.match(/^(\s*)(-\s*)?([A-Za-z0-9_-]+):\s*&([A-Za-z0-9_-]+)\s*(#.*)?$/);
+      if (mapM) {
+        const isListItem = mapM[2] !== undefined;
+        const baseIndent = indentOf(line) + (isListItem ? 2 : 0);
+        for (let j = idx + 1; j < lines.length; j++) {
           const l = lines[j];
-          if (l.trim() === "") { body.push(""); continue; }
-          const indent = l.length - l.trimStart().length;
-          if (indent <= runIndent) break;
-          body.push(l);
-        }
-        const nonBlank = body.filter((l) => l.trim() !== "");
-        if (nonBlank.length > 0) {
-          const minIndent = Math.min(...nonBlank.map((l) => l.length - l.trimStart().length));
-          const dedented = body.map((l) => (l.trim() === "" ? "" : l.slice(minIndent))).join("\n").trim();
-          if (dedented) {
-            findings.push(makeFinding(root, rel, "github-workflow", "run", dedented, String(i++), lineNo));
+          if (l.trim() === "") continue;
+          if (indentOf(l) <= baseIndent) break;
+          const rm = l.match(/^(\s*)-?\s*run:\s*(.*)$/);
+          if (rm) {
+            const rest = rm[2].trim();
+            const bh = rest.match(/^([|>])([+-]?)\s*(#.*)?$/);
+            const value = bh ? collectBlock(j, rm[1].length).body : resolveAlias(rest);
+            if (value) mapAnchors.set(mapM[4], value);
+            // A definition outside a step (an x- key) never runs on its
+            // own; its run line is inventoried at the use sites, not
+            // here. A list item anchor is a real step and stays live.
+            if (!isListItem) definitionRunLines.add(j);
+            break;
           }
         }
-        idx = j - 1;
+      }
+    }
+
+    let i = 0;
+    for (let idx = 0; idx < lines.length; idx++) {
+      if (definitionRunLines.has(idx)) continue;
+      const line = lines[idx];
+      const lineNo = idx + 1;
+      const aliasStep = line.match(/^\s*-\s*\*([A-Za-z0-9_-]+)\s*(#.*)?$/);
+      if (aliasStep) {
+        const name = aliasStep[1];
+        const resolved = scalarAnchors.has(name) || mapAnchors.has(name) ? resolveAlias(`*${name}`) : `*${name}`;
+        findings.push(makeFinding(root, rel, "github-workflow", "run", resolved, String(i++), lineNo));
+        continue;
+      }
+      const mergeKey = line.match(/^\s*<<:\s*\*([A-Za-z0-9_-]+)\s*(#.*)?$/);
+      if (mergeKey) {
+        const name = mergeKey[1];
+        const resolved = scalarAnchors.has(name) || mapAnchors.has(name) ? resolveAlias(`*${name}`) : `*${name}`;
+        findings.push(makeFinding(root, rel, "github-workflow", "run", resolved, String(i++), lineNo));
+        continue;
+      }
+      const m = line.match(/^(\s*)-?\s*run:\s*(.*)$/);
+      if (!m) continue;
+      const runIndent = m[1].length;
+      let rest = m[2].trim();
+      const lineNoRun = idx + 1;
+      // A run value that defines an anchor (run: &name cmd) is itself
+      // executable; register the anchor and inventory the value.
+      const anchorDef = rest.match(/^&([A-Za-z0-9_-]+)\s+(.+)$/);
+      if (anchorDef) {
+        scalarAnchors.set(anchorDef[1], unquote(anchorDef[2]));
+        rest = anchorDef[2].trim();
+      } else if (/^\*[A-Za-z0-9_-]+$/.test(rest)) {
+        rest = resolveAlias(rest);
+      }
+      const blockHeader = rest.match(/^([|>])([+-]?)\s*(#.*)?$/);
+      if (blockHeader) {
+        const { body, end } = collectBlock(idx, runIndent);
+        if (body) {
+          findings.push(makeFinding(root, rel, "github-workflow", "run", body, String(i++), lineNoRun));
+        }
+        idx = end - 1;
         continue;
       }
       if (rest === "") continue;
-      findings.push(makeFinding(root, rel, "github-workflow", "run", rest, String(i++), lineNo));
+      findings.push(makeFinding(root, rel, "github-workflow", "run", rest, String(i++), lineNoRun));
     }
   }
 }
 
-function scanGitHooks(root: string, findings: HookFinding[]): void {
-  scanDirFiles(root, ".githooks", "githooks", findings);
+function scanGitHooks(root: string, findings: HookFinding[], warnings: string[]): void {
+  scanDirFiles(root, ".githooks", "githooks", findings, warnings);
 }
 
 /**
@@ -1367,13 +1621,16 @@ export function scanHooks(root: string): ScanReport {
   scanPackageJson(root, findings, warnings);
   scanClaude(root, findings, warnings);
   scanVscode(root, findings, warnings);
-  scanDirFiles(root, ".husky", "husky", findings);
-  scanLefthook(root, findings);
-  scanPreCommit(root, findings);
+  scanDirFiles(root, ".husky", "husky", findings, warnings);
+  scanLefthook(root, findings, warnings);
+  scanPreCommit(root, findings, warnings);
   scanAgentDirs(root, findings, warnings);
-  for (const rel of [".mcp.json", "mcp.json", ".cursor/mcp.json"]) scanMcpFile(root, rel, findings, warnings);
-  scanWorkflows(root, findings);
-  scanGitHooks(root, findings);
+  // MCP config surfaces, each inventoried exactly once (P-035).
+  // .windsurf/mcp.json joined the covered surfaces in v0.1.6 (P-034);
+  // .vscode/mcp.json is handled inside scanVscode.
+  for (const rel of [".mcp.json", "mcp.json", ".cursor/mcp.json", ".windsurf/mcp.json", ".codex/mcp.json"]) scanMcpFile(root, rel, findings, warnings);
+  scanWorkflows(root, findings, warnings);
+  scanGitHooks(root, findings, warnings);
 
   // Dedupe identical ids (agent dir scan may double count mcp.json).
   const seen = new Set<string>();
@@ -1389,9 +1646,17 @@ export function scanHooks(root: string): ScanReport {
     risky: deduped.filter((f) => f.classification === "RISKY").length,
     unknown: deduped.filter((f) => f.classification === "UNKNOWN").length,
   };
+  // Partial scan floor (P-049): when any inventoried file or directory
+  // could not be read, the scan did not see the whole estate, so a bare
+  // CLEAN is not an honest verdict. Floor at REVIEW; the warnings name
+  // exactly what was missed.
+  let verdict = computeVerdict(deduped);
+  if (verdict === "CLEAN" && warnings.some((w) => w.startsWith("Unreadable"))) {
+    verdict = "REVIEW";
+  }
   return {
     path: root,
-    verdict: computeVerdict(deduped),
+    verdict,
     findings: deduped,
     counts,
     warnings,
