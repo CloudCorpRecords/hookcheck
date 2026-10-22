@@ -28,16 +28,28 @@ Reports in October 2026 described AI agents orchestrating attacks and a self-pro
 Classification per hook:
 
 - **SAFE**: matches known safe dev patterns such as test, lint, build, typecheck, husky, or lint-staged, and matches no risky rule.
-- **RISKY**: matches at least one risky rule: network fetch, curl piped to a shell, credential store paths such as ~/.ssh or ~/.aws, environment secret access, base64 decoding or eval style obfuscation, shell spawning, inline code execution, or a remote URL.
-- **UNKNOWN**: matches neither safe nor risky patterns. A local script name alone is UNKNOWN until a human reads it. When a hook runs a local file such as `node setup.mjs`, hookcheck reads that file and escalates the finding if the file itself matches risky rules.
+- **RISKY**: matches at least one risky rule: network fetch, curl piped to a shell, base64 decode piped to a shell, credential store paths such as ~/.ssh or ~/.aws, environment secret access, base64 decoding or eval style obfuscation, shell spawning, inline code execution, or a remote URL.
+- **UNKNOWN**: matches neither safe nor risky patterns. A local script name alone is UNKNOWN until a human reads it. When a hook runs a local file such as `node setup.mjs`, hookcheck reads that file and escalates the finding if the file itself matches risky rules. The same one hop following applies to direct script execution (`./setup.sh`), `node --require ./setup.mjs`, and package.json script chains (`postinstall: npm run other-script`).
 
 Verdict rules:
 
 - **CLEAN**: every finding is SAFE, or no hooks were found. Exit code 0.
-- **REVIEW**: at least one UNKNOWN finding, or a RISKY finding without a remote fetch or credential rule. Exit code 1.
-- **COMPROMISED-PATTERN**: at least one RISKY finding that fetches remote code or touches credential stores. This is the Shai-Hulud persistence shape. Treat the repo as untrusted until proven otherwise. Exit code 1.
+- **REVIEW**: at least one UNKNOWN finding, or a RISKY finding without a remote fetch, credential, or decode-and-execute rule. Exit code 1.
+- **COMPROMISED-PATTERN**: at least one RISKY finding that fetches remote code, touches credential stores, or decodes a payload into a shell. This is the Shai-Hulud persistence shape. Treat the repo as untrusted until proven otherwise. Exit code 1.
 
-Every finding reports file, hook id, command text, classification, rule ids, and evidence. Malformed JSON is reported as a warning, never silently ignored.
+Every finding reports file, hook id, command text, classification, rule ids, and evidence. Malformed JSON is reported as a warning, never silently ignored. Scanning a path that does not exist, or that is a file instead of a directory, is a clean error with exit code 2.
+
+## Limits
+
+Honest boundaries, pinned by tests in test/hardening.test.ts:
+
+- One hop only. hookcheck follows a hook into the local file or package.json script it directly invokes, and classifies that target. It does not follow a second hop, and it does not trace data flow inside a script. A payload assembled at runtime from pieces that never appear as a recognizable pattern in any single file will not be named; the hook that runs it will usually still land in UNKNOWN or REVIEW, which is the signal to read it by hand.
+- Pattern based, not execution based. hookcheck never runs the hooks it finds. A RISKY verdict means the command text matches a known bad shape, not that the payload was observed doing harm. A CLEAN verdict means no known shape matched, not that the repo is proven safe.
+- Remote pre-commit repos and remote MCP servers are inventoried, not verified. hookcheck cannot see inside a remote pre-commit repo, so those entries are UNKNOWN with a note to review the pinned rev. A remote MCP server URL is RISKY by construction, because the server autostarts and is remote.
+- Duplicate JSON keys resolve last-wins, exactly as JSON.parse, Node, and npm resolve them, so the scanner sees the same value that would actually run.
+- Non-string package.json script values are skipped: npm only executes string script values, so an array or number in scripts cannot auto-run.
+- Classification reads up to 200,000 characters of a hook file or a referenced local file. Beyond that depth a payload can hide; the cap exists so a hostile file cannot make the scan unbounded.
+- GitHub workflow run steps in block scalars (`run: |`) are inventoried only when they appear as single line run values; multi-line block scalar bodies are not parsed yet.
 
 ## Usage
 

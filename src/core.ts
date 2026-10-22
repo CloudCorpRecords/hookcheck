@@ -5,10 +5,10 @@
  * rules so the same repo always produces the same report.
  */
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 import type { Classification, HookFinding, HookSource, ScanReport, Verdict } from "./types.js";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.1.1";
 
 interface RuleDef {
   id: string;
@@ -18,16 +18,19 @@ interface RuleDef {
   remote?: boolean;
   /** True when this rule indicates credential store access. */
   credential?: boolean;
+  /** True when this pattern is severe enough on its own (decode and execute). */
+  severe?: boolean;
 }
 
 export const RISKY_RULES: RuleDef[] = [
+  { id: "DECODE-PIPE-SH", pattern: /\bbase64\s+(-d|--decode|-D)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh)\b/, evidence: "decodes a base64 payload and pipes it straight into a shell", severe: true },
   { id: "CURL-PIPE-SH", pattern: /\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh)\b/, evidence: "pipes a network download straight into a shell", remote: true },
   { id: "NET-FETCH", pattern: /\b(curl|wget)\b|\bfetch\s*\(|https?\s*\.get\s*\(|requests\.(get|post)\b|Invoke-WebRequest\b|Invoke-RestMethod\b/, evidence: "performs a network fetch", remote: true },
   { id: "REMOTE-URL", pattern: /https?:\/\/[^\s"'`]+/, evidence: "references a remote URL", remote: true },
   { id: "CRED-ACCESS", pattern: /~\/\.ssh|\$HOME\/\.ssh|\.aws\/|~\/\.aws|\.gnupg|id_rsa|id_ed25519|\.npmrc\b|\.netrc\b|credentials(\.json)?\b|\.config\/gh|keychain/i, evidence: "touches a credential store path", credential: true },
   { id: "ENV-ACCESS", pattern: /process\.env|os\.environ|getenv\s*\(|\benv\b.*\b(print|export)|\$\{?\s*(AWS_SECRET|AWS_ACCESS|GITHUB_TOKEN|GH_TOKEN|NPM_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY)/, evidence: "reads environment variables that commonly hold secrets" },
   { id: "ENV-EXFIL", pattern: /(process\.env|os\.environ)[\s\S]{0,80}(fetch|https?|request|post|send|upload)/i, evidence: "combines environment access with an outbound send pattern", credential: true, remote: true },
-  { id: "OBFUSCATION", pattern: /base64\s+(-d|--decode)|atob\s*\(|Buffer\.from\s*\([^)]*base64|\\x[0-9a-fA-F]{2}|eval\s*\(|Function\s*\(/, evidence: "uses decoding or dynamic evaluation often used to hide payloads" },
+  { id: "OBFUSCATION", pattern: /base64\s+(-d|--decode)|atob\s*\(|Buffer\.from\s*\([^)]*base64|\\x[0-9a-fA-F]{2}|\beval\b\s*\(|\beval\b\s+["'$(]|Function\s*\(/, evidence: "uses decoding or dynamic evaluation often used to hide payloads" },
   { id: "SHELL-EXEC", pattern: /\b(child_process|execSync|spawnSync|exec\s*\()\b|\/bin\/(sh|bash)\b|powershell(\.exe)?\b|cmd\.exe\b/, evidence: "spawns a shell or child process" },
   { id: "WRITE-OUTSIDE", pattern: /(>>?|tee)\s+~\/|(>>?|tee)\s+\$HOME\/|chmod\s+\+x/, evidence: "writes outside the repo or changes executable bits" },
   { id: "DOWNLOAD-EXEC", pattern: /\bnode\s+-e\b|\bpython3?\s+-c\b|\bdeno\s+eval\b|\bbun\s+-e\b/, evidence: "executes inline code supplied on the command line" },
@@ -44,7 +47,10 @@ const SAFE_PATTERNS: RegExp[] = [
 ];
 
 export function classifyCommand(command: string): { classification: Classification; rules: string[]; evidence: string } {
-  const cmd = command.trim();
+  // Normalize shell line continuations and stray carriage returns first, so a
+  // payload split as `curl ... \` + newline + `| sh` classifies the same as
+  // the one line form.
+  const cmd = command.replace(/\\\r?\n/g, " ").replace(/\r/g, " ").trim();
   const fired: RuleDef[] = [];
   for (const rule of RISKY_RULES) {
     if (rule.pattern.test(cmd)) fired.push(rule);
@@ -67,26 +73,78 @@ export function classifyCommand(command: string): { classification: Classificati
   return { classification: "UNKNOWN", rules: [], evidence: "no known safe pattern and no risky pattern matched; manual review needed" };
 }
 
-/** If a command runs a local file, inspect that file for risky patterns too. */
+/**
+ * If a command references local script files, inspect those files for risky
+ * patterns too (one hop). References are found by token, not only after an
+ * interpreter name, so `node setup.mjs`, `./setup.sh`, `node --require
+ * ./setup.mjs`, and `bash setup.sh` all resolve. References that escape the
+ * scanned root are never followed.
+ */
 function escalateWithLocalFile(root: string, finding: HookFinding): HookFinding {
-  const m = /\b(?:node|bash|sh|python3?|deno run|bun run)\s+([^\s;&|]+\.(?:mjs|cjs|js|ts|sh|py))\b/.exec(finding.command);
-  if (!m) return finding;
-  const rel = m[1].replace(/^\.\//, "");
-  const abs = join(root, rel);
-  if (!existsSync(abs)) return finding;
-  let content = "";
-  try { content = readFileSync(abs, "utf8").slice(0, 20000); } catch { return finding; }
-  const inner = classifyCommand(content.replace(/\n/g, " "));
-  if (inner.classification === "RISKY") {
-    const rules = Array.from(new Set([...finding.rules, ...inner.rules]));
-    return {
-      ...finding,
-      classification: "RISKY",
-      rules,
-      evidence: `${finding.evidence === "" ? "" : finding.evidence + "; "}referenced local file ${rel} is RISKY: ${inner.evidence}`,
-    };
+  const tokenRe = /[A-Za-z0-9_.\/-]+\.(?:mjs|cjs|js|ts|sh|py)\b/g;
+  const tokens = Array.from(new Set(finding.command.match(tokenRe) ?? [])).slice(0, 5);
+  if (tokens.length === 0) return finding;
+  const rootAbs = resolve(root);
+  let out = finding;
+  for (const token of tokens) {
+    const rel = token.replace(/^\.\//, "");
+    if (rel.includes("://")) continue;
+    const abs = resolve(rootAbs, rel);
+    if (abs !== rootAbs && !abs.startsWith(rootAbs + sep)) continue;
+    if (!existsSync(abs)) continue;
+    let st; try { st = statSync(abs); } catch { continue; }
+    if (!st.isFile()) continue;
+    let content = "";
+    try { content = readFileSync(abs, "utf8").slice(0, 200000); } catch { continue; }
+    const inner = classifyCommand(content.replace(/\n/g, " "));
+    if (inner.classification === "RISKY") {
+      const rules = Array.from(new Set([...out.rules, ...inner.rules]));
+      out = {
+        ...out,
+        classification: "RISKY",
+        rules,
+        evidence: `${out.evidence === "" ? "" : out.evidence + "; "}referenced local file ${rel} is RISKY: ${inner.evidence}`,
+      };
+    }
   }
-  return finding;
+  return out;
+}
+
+/** Classify a command string, including one hop into local files it runs. */
+function classifyWithLocalFile(root: string, source: HookSource, command: string): { classification: Classification; rules: string[]; evidence: string } {
+  const c = classifyCommand(command);
+  const temp: HookFinding = { id: "", file: "", source, hook: "", command, classification: c.classification, rules: c.rules, evidence: c.evidence };
+  const escalated = escalateWithLocalFile(root, temp);
+  return { classification: escalated.classification, rules: escalated.rules, evidence: escalated.evidence };
+}
+
+/**
+ * A watched install script may chain to another package.json script
+ * (`postinstall: npm run evil`). Follow that chain one hop: if the target
+ * script is RISKY (directly or through a local file it runs), the install
+ * hook inherits the classification.
+ */
+function escalateWithScriptChain(root: string, scripts: Record<string, unknown>, currentName: string, finding: HookFinding): HookFinding {
+  const chainRe = /\b(?:npm|yarn|pnpm|bun)\s+(?:run\s+)?([A-Za-z0-9:_-]+)/g;
+  let out = finding;
+  let m: RegExpExecArray | null;
+  while ((m = chainRe.exec(finding.command)) !== null) {
+    const name = m[1];
+    if (name === currentName) continue;
+    const chained = scripts[name];
+    if (typeof chained !== "string" || !chained.trim()) continue;
+    const inner = classifyWithLocalFile(root, "package.json", chained);
+    if (inner.classification === "RISKY") {
+      const rules = Array.from(new Set([...out.rules, ...inner.rules]));
+      out = {
+        ...out,
+        classification: "RISKY",
+        rules,
+        evidence: `${out.evidence === "" ? "" : out.evidence + "; "}via script chain to "${name}": ${inner.evidence}`,
+      };
+    }
+  }
+  return out;
 }
 
 export function computeVerdict(findings: HookFinding[]): Verdict {
@@ -95,7 +153,8 @@ export function computeVerdict(findings: HookFinding[]): Verdict {
     if (f.classification === "RISKY") {
       const hasRemote = f.rules.some((id) => RISKY_RULES.find((r) => r.id === id)?.remote);
       const hasCred = f.rules.some((id) => RISKY_RULES.find((r) => r.id === id)?.credential);
-      if (hasRemote || hasCred) return "COMPROMISED-PATTERN";
+      const hasSevere = f.rules.some((id) => RISKY_RULES.find((r) => r.id === id)?.severe);
+      if (hasRemote || hasCred || hasSevere) return "COMPROMISED-PATTERN";
       review = true;
     } else if (f.classification === "UNKNOWN") {
       review = true;
@@ -122,8 +181,11 @@ function readText(abs: string): string | null {
 function readJson(root: string, rel: string, warnings: string[]): unknown | null {
   const raw = readText(join(root, rel));
   if (raw === null) return null;
+  // Strip a UTF-8 BOM first: Windows editors add one, JSON.parse rejects it,
+  // and skipping the file would hide every hook inside it.
   // Strip simple JSONC comments and trailing commas for VS Code style files.
   const cleaned = raw
+    .replace(/^\uFEFF/, "")
     .replace(/^\s*\/\/.*$/gm, "")
     .replace(/,\s*([}\]])/g, "$1");
   try { return JSON.parse(cleaned); } catch {
@@ -144,11 +206,21 @@ function scanPackageJson(root: string, findings: HookFinding[], warnings: string
     }
     return;
   }
+  if (typeof data !== "object" || Array.isArray(data)) {
+    warnings.push(`${rel} root is not a JSON object: file skipped for structured parsing`);
+    return;
+  }
+  if (data.scripts !== undefined && (typeof data.scripts !== "object" || data.scripts === null || Array.isArray(data.scripts))) {
+    warnings.push(`scripts key in ${rel} is not an object: install hooks skipped`);
+    return;
+  }
+  const scripts = (data.scripts ?? {}) as Record<string, unknown>;
   const watched = ["preinstall", "install", "postinstall", "prepare", "prepublish", "prepublishOnly"];
   for (const name of watched) {
-    const cmd = data.scripts?.[name];
+    const cmd = scripts[name];
     if (typeof cmd === "string" && cmd.trim()) {
-      findings.push(makeFinding(root, rel, "package.json", name, cmd));
+      const finding = makeFinding(root, rel, "package.json", name, cmd);
+      findings.push(escalateWithScriptChain(root, scripts, name, finding));
     }
   }
 }
@@ -172,36 +244,53 @@ function collectClaudeHooks(node: unknown, file: string, root: string, findings:
 function scanClaude(root: string, findings: HookFinding[], warnings: string[]): void {
   for (const rel of [".claude/settings.json", ".claude/settings.local.json"]) {
     if (!existsSync(join(root, rel))) continue;
-    const data = readJson(root, rel, warnings) as { hooks?: unknown } | null;
-    if (!data) continue;
-    if (data.hooks) collectClaudeHooks(data.hooks, rel, root, findings, "");
-    else warnings.push(`No hooks key in ${rel}`);
+    const data = readJson(root, rel, warnings) as Record<string, unknown> | null;
+    if (!data || typeof data !== "object") continue;
+    if (!("hooks" in data)) { warnings.push(`No hooks key in ${rel}`); continue; }
+    const hooks = data.hooks;
+    if (!hooks || typeof hooks !== "object") {
+      warnings.push(`hooks key in ${rel} is not an object: hooks skipped`);
+      continue;
+    }
+    collectClaudeHooks(hooks, rel, root, findings, "");
   }
 }
 
 function scanVscode(root: string, findings: HookFinding[], warnings: string[]): void {
   const rel = ".vscode/tasks.json";
-  if (!existsSync(join(root, rel))) return;
-  const data = readJson(root, rel, warnings) as { tasks?: Array<Record<string, unknown>> } | null;
-  if (!data?.tasks) return;
-  data.tasks.forEach((task, idx) => {
-    const runOptions = (task.runOptions ?? {}) as Record<string, unknown>;
-    const runOn = runOptions.runOn;
-    const isFolderOpen = runOn === "folderOpen" || (Array.isArray(runOn) && runOn.includes("folderOpen"));
-    const command = typeof task.command === "string" ? task.command : "";
-    const args = Array.isArray(task.args) ? task.args.filter((a) => typeof a === "string").join(" ") : "";
-    const full = [command, args].filter(Boolean).join(" ").trim();
-    if (!full) return;
-    const label = typeof task.label === "string" ? task.label : `task-${idx}`;
-    if (isFolderOpen) {
-      findings.push(makeFinding(root, rel, "vscode-tasks", `folderOpen:${label}`, full, String(idx)));
-    } else {
-      // Inventory non auto-run tasks at lower weight: still record them so
-      // explain can find them, classified by their command.
-      const f = makeFinding(root, rel, "vscode-tasks", label, full, String(idx));
-      findings.push(f);
+  if (existsSync(join(root, rel))) {
+    const data = readJson(root, rel, warnings) as { tasks?: unknown } | null;
+    if (data && data.tasks !== undefined && !Array.isArray(data.tasks)) {
+      warnings.push(`tasks key in ${rel} is not an array: tasks skipped`);
     }
-  });
+    const tasks = Array.isArray(data?.tasks) ? data.tasks : [];
+    tasks.forEach((rawTask, idx) => {
+      // Malformed entries (null, strings, numbers) are skipped, never fatal:
+      // one bad task must not hide every other surface in the repo.
+      if (!rawTask || typeof rawTask !== "object") return;
+      const task = rawTask as Record<string, unknown>;
+      const runOptions = (task.runOptions ?? {}) as Record<string, unknown>;
+      const options = (task.options ?? {}) as Record<string, unknown>;
+      const optionsRunOptions = (options.runOptions ?? {}) as Record<string, unknown>;
+      // folderOpen lives in runOptions in the standard schema, but real
+      // world files also nest it under options or put runOn on the task.
+      const runOn = runOptions.runOn ?? optionsRunOptions.runOn ?? task.runOn;
+      const isFolderOpen = runOn === "folderOpen" || (Array.isArray(runOn) && runOn.includes("folderOpen"));
+      const command = typeof task.command === "string" ? task.command : "";
+      const args = Array.isArray(task.args) ? task.args.filter((a) => typeof a === "string").join(" ") : "";
+      const full = [command, args].filter(Boolean).join(" ").trim();
+      if (!full) return;
+      const label = typeof task.label === "string" ? task.label : `task-${idx}`;
+      if (isFolderOpen) {
+        findings.push(makeFinding(root, rel, "vscode-tasks", `folderOpen:${label}`, full, String(idx)));
+      } else {
+        // Inventory non auto-run tasks at lower weight: still record them so
+        // explain can find them, classified by their command.
+        const f = makeFinding(root, rel, "vscode-tasks", label, full, String(idx));
+        findings.push(f);
+      }
+    });
+  }
   // MCP config inside .vscode
   scanMcpFile(root, ".vscode/mcp.json", findings, warnings);
 }
@@ -221,7 +310,9 @@ function scanDirFiles(root: string, dirRel: string, source: HookSource, findings
     const firstMeaningful = content.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#") && !l.startsWith("set -")).join(" ");
     const fileRel = `${dirRel}/${name}`;
     // Entire file content is the command surface for husky style hooks.
-    findings.push(makeFinding(root, fileRel, source, name, content.trim().slice(0, 500)));
+    // Classify generously deep into the file: a payload hidden behind
+    // padding must still be seen. Display code truncates separately.
+    findings.push(makeFinding(root, fileRel, source, name, content.trim().slice(0, 200000)));
     void firstMeaningful;
   }
 }
@@ -249,7 +340,20 @@ function scanPreCommit(root: string, findings: HookFinding[]): void {
   }
   const repoRe = /^\s*-\s*repo:\s*(https?:\/\/\S+)$/gm;
   while ((m = repoRe.exec(raw)) !== null) {
-    findings.push(makeFinding(root, rel, "pre-commit", "remote-repo", m[1].trim(), String(i++)));
+    // A remote hook repo is the standard pre-commit pattern, not a finding
+    // of compromise: the URL alone is inventoried as UNKNOWN so a human can
+    // review the pinned rev. Classifying the bare URL with the command
+    // rules would verdict every normal pre-commit config COMPROMISED.
+    findings.push({
+      id: `${rel}:remote-repo:${i++}`,
+      file: rel,
+      source: "pre-commit",
+      hook: "remote-repo",
+      command: m[1].trim(),
+      classification: "UNKNOWN",
+      rules: [],
+      evidence: "remote pre-commit hook repo (standard pattern): its hooks run locally at commit time; hookcheck cannot verify remote contents, review the pinned rev",
+    });
   }
 }
 
@@ -270,7 +374,7 @@ function scanAgentDirs(root: string, findings: HookFinding[], warnings: string[]
       } else {
         const content = readText(fileAbs);
         if (content && content.trim()) {
-          findings.push(makeFinding(root, rel, source, name, content.trim().slice(0, 500)));
+          findings.push(makeFinding(root, rel, source, name, content.trim().slice(0, 200000)));
         }
       }
       if (name === "mcp.json") scanMcpFile(root, rel, findings, warnings);
@@ -336,8 +440,18 @@ function scanGitHooks(root: string, findings: HookFinding[]): void {
 export function scanHooks(root: string): ScanReport {
   const findings: HookFinding[] = [];
   const warnings: string[] = [];
-  if (!existsSync(root)) {
+  let rootStat = null;
+  try { rootStat = statSync(root); } catch { rootStat = null; }
+  if (!rootStat) {
     warnings.push(`Path does not exist: ${root}`);
+    return {
+      path: root, verdict: "REVIEW", findings, warnings,
+      counts: { total: 0, safe: 0, risky: 0, unknown: 0 },
+      scannedAt: new Date().toISOString(),
+    };
+  }
+  if (!rootStat.isDirectory()) {
+    warnings.push(`Path is not a directory: ${root}`);
     return {
       path: root, verdict: "REVIEW", findings, warnings,
       counts: { total: 0, safe: 0, risky: 0, unknown: 0 },
