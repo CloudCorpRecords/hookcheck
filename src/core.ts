@@ -8,7 +8,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type { Classification, HookFinding, HookSource, ScanReport, Verdict } from "./types.js";
 
-export const VERSION = "0.1.11";
+export const VERSION = "0.1.12";
 
 interface RuleDef {
   id: string;
@@ -534,14 +534,158 @@ function fetchPositions(text: string, depth = 0): Set<number> {
   return out;
 }
 
-/** True when a CURL-PIPE-SH match in `codeJoined` starts a real fetch. */
-function curlPipeIsCommandFetch(codeJoined: string, positions: Set<number>): boolean {
+/**
+ * True when a CURL-PIPE-SH match starts a real fetch and feeds an
+ * interpreter that executes stdin. Matches run on the newline
+ * preserving code text (the same text fetchPositions indexes), so
+ * the pipe target's own line bounds its argument tail: the next
+ * line of a block step is a new statement, never a target operand.
+ */
+function curlPipeIsCommandFetch(codeText: string, positions: Set<number>): boolean {
   if (positions.size === 0) return false;
-  for (const m of codeJoined.matchAll(/\b(curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh|node|python3?|perl|ruby)\b/g)) {
+  for (const m of codeText.matchAll(/\b(curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(sh|bash|zsh|node|python3?|perl|ruby)\b/g)) {
     const at = m.index + m[0].indexOf(m[1]);
-    if (positions.has(at)) return true;
+    if (!positions.has(at)) continue;
+    if (pipeTargetExecutesStdin(m[2], pipeTail(codeText, m.index + m[0].length))) return true;
   }
   return false;
+}
+
+/** True when any DECODE-PIPE-SH match feeds an interpreter that executes stdin. */
+function decodePipeExecutesStdin(codeText: string): boolean {
+  for (const m of codeText.matchAll(/\bbase64\s+(?:-d|--decode|-D)\b[^|]*\|\s*(?:sudo\s+)?(sh|bash|zsh|node|python3?|perl|ruby)\b/g)) {
+    if (pipeTargetExecutesStdin(m[1], pipeTail(codeText, m.index + m[0].length))) return true;
+  }
+  return false;
+}
+
+/**
+ * The text of the pipeline segment that follows a pipe target
+ * interpreter word, cut at the next unquoted pipe, statement
+ * separator, or redirection (quoted program text is kept whole).
+ */
+function pipeTail(text: string, from: number): string {
+  let quote = "";
+  for (let i = from; i < text.length; i++) {
+    const c = text[i];
+    if (quote) {
+      if (c === "\\" && quote === '"') { i++; continue; }
+      if (c === quote) quote = "";
+      continue;
+    }
+    if (c === "'" || c === '"' || c === "`") { quote = c; continue; }
+    if (c === "|" || c === ";" || c === "&" || c === ">" || c === "<" || c === "\n") return text.slice(from, i);
+  }
+  return text.slice(from);
+}
+
+/** Quote aware spans of the whitespace separated tokens in `seg`. */
+function shellTokenSpans(seg: string): Array<{ start: number; end: number; text: string }> {
+  const out: Array<{ start: number; end: number; text: string }> = [];
+  let i = 0;
+  while (i < seg.length) {
+    while (i < seg.length && /\s/.test(seg[i])) i++;
+    if (i >= seg.length) break;
+    const start = i;
+    let quote = "";
+    while (i < seg.length) {
+      const c = seg[i];
+      if (quote) {
+        if (c === "\\" && quote === '"') { i += 2; continue; }
+        if (c === quote) quote = "";
+        i++;
+        continue;
+      }
+      if (c === "'" || c === '"' || c === "`") { quote = c; i++; continue; }
+      if (/\s/.test(c)) break;
+      i++;
+    }
+    out.push({ start, end: i, text: seg.slice(start, i) });
+  }
+  return out;
+}
+
+function unquoteToken(t: string): string {
+  if (t.length >= 2 && ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'")))) return t.slice(1, -1);
+  return t;
+}
+
+/**
+ * True when an inline program handed to an interpreter (-e, -c)
+ * itself executes what arrives on stdin: an exec or eval construct
+ * combined with a stdin reference. A constant program that only
+ * READS stdin as data (the MC-6 shape: JSON.parse of the piped
+ * response) does not execute it.
+ */
+function programExecutesStdin(program: string): boolean {
+  const execy = /\bexec\w*\s*\(|\beval\s*\(|\bFunction\s*\(|runInThisContext|runInNewContext|\bVM\b.*\brun\b/;
+  const stdiny = /stdin|\/dev\/stdin|<&0|os\.read\(\s*0|read\(\s*0\s*[,)]/;
+  return execy.test(program) && stdiny.test(program);
+}
+
+/**
+ * Pipe target analysis (P-109d, completing the MC-6 calibration).
+ * A pipe into an interpreter is download-then-execute only when the
+ * interpreter reads its PROGRAM from stdin: a bare interpreter, a
+ * lone dash, or an interpreter carrying only mode flags (-s, -x,
+ * -u and friends). When the invocation supplies its program
+ * another way, stdin is data the program parses, not code it runs:
+ *   - a -c or -e inline program (unless that program itself
+ *     executes stdin, which programExecutesStdin catches);
+ *   - a -m module (python3 -m json.tool is the canonical data
+ *     parser shape, the jq role with a different binary);
+ *   - a script file operand (node script.js, bash setup.sh).
+ * The OpenHands mock LLM health checks pipe a loopback curl
+ * response into python3 -m json.tool; on 0.1.11 that match alone
+ * carried CURL-PIPE-SH and the top verdict.
+ */
+function pipeTargetExecutesStdin(interp: string, tail: string): boolean {
+  // The interpreter word can sit inside a quoted command string
+  // handed to an interpreter (execSync('curl ... | sh')): the tail
+  // then opens with the string's closing quote and call punctuation,
+  // which is the end of the target invocation, not an operand.
+  const tt = tail.trimStart();
+  if (tt === "" || /^['"`)\];,}]/.test(tt)) return true;
+  const toks = shellTokenSpans(tt);
+  if (toks.length === 0) return true;
+  const shell = interp === "sh" || interp === "bash" || interp === "zsh";
+  for (let i = 0; i < toks.length; i++) {
+    const t = unquoteToken(toks[i].text);
+    if (t === "-") return true; // a lone dash: the program comes from stdin
+    if (t === "--") return true; // only positional arguments follow; the program is still stdin
+    if (t.startsWith("-") && t.length > 1) {
+      const cluster = t.replace(/^-+/, "");
+      const name = cluster.split("=")[0];
+      const attached = cluster.includes("=") ? cluster.slice(cluster.indexOf("=") + 1) : cluster.length > name.length ? cluster.slice(name.length) : "";
+      const programOf = (): string => {
+        if (attached) return attached;
+        const next = toks[i + 1];
+        return next ? unquoteToken(next.text) : "";
+      };
+      if (shell) {
+        // sh and bash take their program from -c; -o takes a value.
+        if (/(^|[^a-zA-Z])c$/.test(name) || name === "c") return programExecutesStdin(programOf());
+        if (name.endsWith("o")) { i++; continue; }
+        continue;
+      }
+      if (interp === "node" || interp === "bun") {
+        if (name === "e" || name === "eval" || name === "p" || name === "print") return programExecutesStdin(programOf());
+        continue;
+      }
+      if (interp === "python" || interp === "python3") {
+        if (name === "c") return programExecutesStdin(programOf());
+        if (name === "m") return false; // a module is the program; stdin is its data
+        if (name === "W" || name === "X") { i++; continue; }
+        continue;
+      }
+      // perl and ruby take their program from -e.
+      if (name === "e") return programExecutesStdin(programOf());
+      continue;
+    }
+    // A bare operand is a script file: it is the program, stdin is data.
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -591,6 +735,92 @@ function shellEchoDataRanges(text: string): TextRange[] {
   return ranges;
 }
 
+const SEARCH_HEADS = new Set(["grep", "egrep", "fgrep", "rg", "ag", "ack"]);
+/** Short search flags whose next token is a value that is not the pattern (counts, context widths). */
+const SEARCH_VALUE_FLAGS = new Set(["m", "A", "B", "C", "d", "D"]);
+
+/**
+ * Search pattern and search input ranges in shell text (P-108).
+ * A search command (grep, egrep, fgrep, rg, ag, ack in command
+ * position, the P-062 discipline) reads its pattern as DATA to
+ * match against, and its file operands as data to search: neither
+ * is behavior. github/docs lints its lockfile by grepping .npmrc
+ * and package-lock.json for Microsoft feed URL patterns so it can
+ * BLOCK them; on 0.1.11 the .npmrc operand fired CRED-ACCESS and a
+ * URL inside a pattern could fire REMOTE-URL, and the pair fed
+ * verdict path (b) to COMPROMISED-PATTERN. Content inside a search
+ * pattern is pattern text, not behavior, for both halves of a
+ * strong evidence combination, and a credential path string used
+ * as a search target is a reference, not credential access.
+ *
+ * Ranges are per pipeline segment: the pattern operand (the first
+ * bare token, or the value of -e, -f, --regexp, --file, or
+ * --pattern) and the file operands after it. A token containing a
+ * command substitution is left visible (its content can execute),
+ * parsing stops at a redirection (its target is a write, judged on
+ * its own text), and other statements in the same step are
+ * untouched: a grep followed by a cat of a credential file, or by
+ * a fetch of the grepped URL, still fires on those statements.
+ */
+function searchRanges(text: string): { pattern: TextRange[]; operands: TextRange[] } {
+  const pattern: TextRange[] = [];
+  const operands: TextRange[] = [];
+  for (const stmt of splitShell(text, ["\n", ";", "&&", "||"])) {
+    const stmtText = text.slice(stmt.start, stmt.end);
+    for (const seg of splitShell(stmtText, ["|"])) {
+      const segText = stmtText.slice(seg.start, seg.end);
+      const head = segmentHead(segText);
+      if (!head || !SEARCH_HEADS.has(head.word)) continue;
+      const afterHead = head.idx + head.word.length;
+      const base = stmt.start + seg.start + afterHead;
+      const toks = shellTokenSpans(segText.slice(afterHead));
+      let patternSeen = false;
+      let expect: "pattern" | "other" | null = null;
+      let afterDashDash = false;
+      for (const tok of toks) {
+        const g = { start: base + tok.start, end: base + tok.end };
+        const dynamic = tok.text.includes("$(") || tok.text.includes("`");
+        const t = unquoteToken(tok.text);
+        if (expect === "pattern") {
+          if (!dynamic) pattern.push(g);
+          patternSeen = true;
+          expect = null;
+          continue;
+        }
+        if (expect === "other") { expect = null; continue; }
+        if (!afterDashDash && t === "--") { afterDashDash = true; continue; }
+        if (!afterDashDash && /^(?:\d+)?[<>]/.test(t)) break;
+        if (!afterDashDash && t.startsWith("--")) {
+          const eq = t.indexOf("=");
+          const name = eq === -1 ? t : t.slice(0, eq);
+          if (name === "--regexp" || name === "--file" || name === "--pattern") {
+            if (eq !== -1) { if (!dynamic) pattern.push(g); patternSeen = true; } else expect = "pattern";
+          } else if (["--max-count", "--after-context", "--before-context", "--context", "--directory", "--devices", "--exclude", "--include", "--type", "--glob", "--max-filesize"].includes(name)) {
+            if (eq === -1) expect = "other";
+          }
+          continue;
+        }
+        if (!afterDashDash && t.startsWith("-") && t.length > 1) {
+          const cluster = t.slice(1);
+          const ei = cluster.search(/[ef]/);
+          if (ei !== -1 && !patternSeen) {
+            if (ei < cluster.length - 1) { if (!dynamic) pattern.push(g); patternSeen = true; } else expect = "pattern";
+            continue;
+          }
+          if (SEARCH_VALUE_FLAGS.has(cluster[cluster.length - 1])) { expect = "other"; continue; }
+          continue;
+        }
+        if (dynamic) {
+          if (!patternSeen) patternSeen = true;
+          continue;
+        }
+        if (!patternSeen) { pattern.push(g); patternSeen = true; } else operands.push(g);
+      }
+    }
+  }
+  return { pattern, operands };
+}
+
 interface Views {
   codeText: string;
   credText: string;
@@ -621,8 +851,19 @@ const NETWORK_CALL_RES: RegExp[] = [
 
 function buildViews(text: string, lang: Lang): Views {
   if (lang === "shell") {
-    const dataRanges = shellEchoDataRanges(text);
-    return { codeText: blankRanges(text, dataRanges), credText: text, dataRanges, urlText: text };
+    const echoRanges = shellEchoDataRanges(text);
+    // Search text is data (P-108): pattern contents are blanked in
+    // the behavior and URL views, and pattern plus search input
+    // operands are blanked in the credential view, so a defensive
+    // grep supplies neither half of a strong evidence combination.
+    const search = searchRanges(text);
+    const dataRanges = [...echoRanges, ...search.pattern];
+    return {
+      codeText: blankRanges(text, dataRanges),
+      credText: blankRanges(text, [...search.pattern, ...search.operands]),
+      dataRanges,
+      urlText: blankRanges(text, search.pattern),
+    };
   }
   const literals = lang === "python" ? scanPyLiterals(text) : scanJsLiterals(text);
   const execSpans = callFirstArgSpans(text, EXEC_CALLS, literals);
@@ -1899,7 +2140,14 @@ export function classifyCommand(command: string, lang: Lang = "shell"): { classi
       continue;
     }
     if (rule.id === "CURL-PIPE-SH") {
-      if (curlPipeIsCommandFetch(codeJoined, positions)) fired.push({ id: rule.id, evidence: rule.evidence });
+      if (curlPipeIsCommandFetch(views.codeText, positions)) fired.push({ id: rule.id, evidence: rule.evidence });
+      continue;
+    }
+    if (rule.id === "DECODE-PIPE-SH") {
+      // Same pipe target analysis as CURL-PIPE-SH (P-109d): decoded
+      // content piped into an interpreter that is given its program
+      // is data for that program, not executed code.
+      if (decodePipeExecutesStdin(views.codeText)) fired.push({ id: rule.id, evidence: rule.evidence });
       continue;
     }
     const hay = rule.id === "REMOTE-URL" ? urlJoined : codeJoined;
@@ -2135,42 +2383,115 @@ function escalateWithScriptChain(root: string, scripts: Record<string, unknown>,
  * estate verdicts REVIEW, never COMPROMISED-PATTERN.
  */
 /**
- * Vendor installer pipe calibration (P-063, Wave B). A CI workflow step
- * whose ONLY severe evidence is a curl pipe to a named vendor's
- * official installer over HTTPS (the uv installer at astral.sh, the
- * opencode installer) is the same family as the esbuild and puppeteer
- * download-own-binary installers the v0.1.2 calibration already holds
- * at REVIEW: the pattern match is literal and the finding stays RISKY,
- * but nothing about the step exfils, persists, or touches a credential.
- * The narrowing is deliberately tight; ALL of these must hold:
+ * Vendor installer pipe calibration (P-063, Wave B; composition
+ * completed in P-109). A CI workflow step whose ONLY severe evidence
+ * is a curl pipe to a named vendor's official installer over HTTPS
+ * (the uv installer at astral.sh, the opencode installer) is the same
+ * family as the esbuild and puppeteer download-own-binary installers
+ * the v0.1.2 calibration already holds at REVIEW: the pattern match
+ * is literal and the finding stays RISKY, but nothing about the step
+ * exfils, persists, or touches a credential. The narrowing is
+ * deliberately tight; ALL of these must hold:
  *   - the finding is a GitHub workflow run step (CI context). The same
  *     pipe on an auto-exec hook surface (package.json script, Claude
  *     settings or plugin hook, folderOpen task) keeps the top verdict:
  *     a hook runs on a developer machine at open or install time,
  *     which is exactly the Shai-Hulud persistence shape;
  *   - CURL-PIPE-SH is the only severe rule, and every rule present is
- *     part of the pipe shape itself (CURL-PIPE-SH, NET-FETCH,
- *     REMOTE-URL). Any credential rule, persistence rule, or second
- *     severe signal disqualifies the finding;
- *   - the piped URL is HTTPS and installer shaped: a path segment
- *     named install, installer, or setup (optionally with a script
- *     extension), or a host on the short known-installer list below.
+ *     part of the pipe shape itself or of the install's own footprint
+ *     in the same step: CURL-PIPE-SH, NET-FETCH, and REMOTE-URL are
+ *     the pipe; WRITE-OUTSIDE is the footprint (P-109c: the rollup
+ *     nvm step that sources the profile it just installed and
+ *     chmods the binary it just built; an installer writing under
+ *     $HOME is its shape, not a second signal). Any credential rule
+ *     (CRED-ACCESS, ENV-ACCESS, ENV-BULK, either exfil rule), any
+ *     obfuscation, or a second severe signal disqualifies the
+ *     finding on its own merits;
+ *   - the piped URL is HTTPS and installer shaped or same-repo
+ *     shaped (see installerUrlShape).
  * A curl pipe to an unversioned or non-vendor source (payload.sh on an
  * arbitrary host) never qualifies.
+ *
+ * Composition (P-109d): the calibration is a property of the single
+ * finding, evaluated at the verdict layer per finding. A calibrated
+ * pipe never drives the top verdict, and no other finding can
+ * re-arm it; every other finding in the estate stands or falls on
+ * its own merits (an unrelated ENV-EXFIL finding verdicts the repo
+ * COMPROMISED-PATTERN by itself, a DOWNLOAD-EXEC only finding does
+ * not, and neither outcome changes what the pipes contribute).
  */
-const KNOWN_INSTALLER_HOSTS = new Set(["sh.rustup.rs", "get.docker.com", "install.python-poetry.org", "astral.sh", "opencode.ai"]);
+const KNOWN_INSTALLER_HOSTS = new Set(["sh.rustup.rs", "get.docker.com", "install.python-poetry.org", "astral.sh", "opencode.ai", "pyenv.run"]);
+/**
+ * Installer endpoints are conventionally served from a dedicated
+ * subdomain of the vendor domain whose first label names the
+ * installer role: get.docker.com, install.python-poetry.org,
+ * sh.rustup.rs, and (P-109a) get.maestro.mobile.dev, the Maestro
+ * installer host that verdicts meteor/meteor on 0.1.11. pyenv.run
+ * sits in the known list above instead: it is the documented pyenv
+ * installer endpoint (the pyenv README install command is
+ * `curl https://pyenv.run | bash`) with no subdomain to generalize.
+ */
+const INSTALLER_SUBDOMAINS = new Set(["get", "install", "installer", "setup", "sh"]);
+const OWN_REPO_REF = /(?:\$\{\{\s*github\.repository\s*\}\}|\$\{\s*GITHUB_REPOSITORY\s*\}|\$GITHUB_REPOSITORY\b)/;
+const OWN_SHA_REF = /(?:\$\{\{\s*github\.sha\s*\}\}|\$\{\s*GITHUB_SHA\s*\}|\$GITHUB_SHA\b)/;
+
+/**
+ * True when one piped URL is a calibrated download source:
+ *   - installer shaped (P-063, generalized in P-109a): any path
+ *     segment carries install, installer, or setup as a whole
+ *     hyphen, underscore, or dot delimited token (install.sh,
+ *     setup_lts.x, and astral's cargo-hawk-installer.sh, whose
+ *     segment is not exactly an installer word), or the host is a
+ *     documented installer host (the known list, or the installer
+ *     subdomain convention). A segment that merely CONTAINS an
+ *     installer word inside a larger token (uninstall.sh) is not an
+ *     installer shape;
+ *   - or the repo's own script at the immutable commit under test
+ *     (P-109b): the URL is on github.com or
+ *     raw.githubusercontent.com, names the repo through the
+ *     repository variable or expression, and pins the ref through
+ *     the SHA variable or expression (${GITHUB_SHA} or
+ *     ${{ github.sha }}). nodejs/node pipes its own start-ci and
+ *     release-proposal scripts this way; content at the commit
+ *     already being tested adds no trust surface beyond the code
+ *     already running. A literal other repo, or the same repo at a
+ *     mutable ref, is not verified same-repo content and does not
+ *     qualify.
+ */
+function installerUrlShape(url: string): boolean {
+  const m = url.match(/^https:\/\/([^\s"'`/:?#]+)([^\s"'`]*)/i);
+  if (!m) return false;
+  const host = m[1].toLowerCase();
+  const path = (m[2] ?? "").toLowerCase();
+  if ((host === "github.com" || host === "raw.githubusercontent.com") && OWN_REPO_REF.test(url) && OWN_SHA_REF.test(url)) return true;
+  for (const seg of path.split("/")) {
+    if (!seg) continue;
+    const tokens = seg.split(/[-_.]+/).filter(Boolean);
+    if (tokens.some((t) => t === "install" || t === "installer" || t === "setup")) return true;
+  }
+  if (KNOWN_INSTALLER_HOSTS.has(host)) return true;
+  return INSTALLER_SUBDOMAINS.has(host.split(".")[0]);
+}
 
 function isVendorInstallerPipeOnly(f: HookFinding): boolean {
   if (f.source !== "github-workflow") return false;
   if (!f.rules.includes("CURL-PIPE-SH")) return false;
-  const allowed = new Set(["CURL-PIPE-SH", "NET-FETCH", "REMOTE-URL"]);
+  const allowed = new Set(["CURL-PIPE-SH", "NET-FETCH", "REMOTE-URL", "WRITE-OUTSIDE"]);
   if (!f.rules.every((r) => allowed.has(r))) return false;
-  const m = f.command.match(/https:\/\/([^\s"'`/:?#]+)([^\s"'`]*)/i);
-  if (!m) return false;
-  const host = m[1].toLowerCase();
-  const path = (m[2] ?? "").toLowerCase();
-  if (/(^|\/)(install|installer|setup)(\.(sh|bash|ps1|py))?($|[/?#])/.test(path)) return true;
-  return KNOWN_INSTALLER_HOSTS.has(host);
+  // The piped URL is the URL inside a curl pipe segment of the
+  // command. When the pipe segment holds no literal URL (the URL is
+  // in a variable assigned earlier in the step), fall back to the
+  // URLs elsewhere in the command, as before P-109. Actions
+  // expressions are whitespace collapsed first, the same
+  // normalization classification applies, so a URL spelled with
+  // ${{ github.repository }} and ${{ github.sha }} parses whole.
+  const cmd = f.command.replace(/\$\{\{([\s\S]*?)\}\}/g, (_m, inner: string) => "${{" + inner.replace(/\s+/g, "") + "}}");
+  const pipedUrls: string[] = [];
+  for (const m of cmd.matchAll(/\b(?:curl|wget)\b[^|]*\|/g)) {
+    pipedUrls.push(...(m[0].match(/https:\/\/[^\s"'`]+/gi) ?? []));
+  }
+  const candidates = pipedUrls.length > 0 ? pipedUrls : (cmd.match(/https:\/\/[^\s"'`]+/gi) ?? []);
+  return candidates.some((u) => installerUrlShape(u));
 }
 
 export function computeVerdict(findings: HookFinding[]): Verdict {
@@ -2181,8 +2502,10 @@ export function computeVerdict(findings: HookFinding[]): Verdict {
       const hasSevere = metas.some((x) => x.severe);
       const hasCredStore = f.rules.includes("CRED-ACCESS");
       const hasNet = metas.some((x) => x.remote);
-      // P-063: a lone vendor installer pipe in CI is strong pattern
-      // evidence but not, on its own, a compromise pattern.
+      // P-063 and P-109: the installer pipe calibration is per
+      // finding. A calibrated pipe is strong pattern evidence but
+      // not, on its own, a compromise pattern; it neither drives
+      // the top verdict nor is re-armed by any other finding.
       const vendorPipeOnly = isVendorInstallerPipeOnly(f);
       if ((hasSevere && !vendorPipeOnly) || (hasCredStore && hasNet)) return "COMPROMISED-PATTERN";
       review = true;
