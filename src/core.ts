@@ -8,7 +8,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type { Classification, HookFinding, HookSource, ScanReport, Verdict } from "./types.js";
 
-export const VERSION = "0.1.13";
+export const VERSION = "0.1.14";
 
 interface RuleDef {
   id: string;
@@ -1453,6 +1453,95 @@ function authRanges(text: string): TextRange[] {
   }
   for (const m of text.matchAll(/\bauth\s*=\s*\(/g)) {
     ranges.push({ start: m.index, end: consumeBalanced(text, m.index + m[0].length - 1) });
+  }
+  // Credential hand-off positions (P-111). A credential.helper
+  // definition is the credential protocol of the tool performing the
+  // send: git invokes the helper and reads username and password
+  // lines from its stdout, so a token echoed inside a credential
+  // helper is presented as authentication, exactly like a header or
+  // a -u pair. The v0.1.11 auth model scrubbed headers, -u pairs,
+  // extraheader, and URL userinfo, but saw the helper's echoed
+  // password as print disclosure next to a send, which fired
+  // ENV-EXFIL on All-Hands-AI/OpenHands (the Publish live E2E media
+  // step, whose push token is used only inside such a helper). The
+  // same protocol family covers core.askPass values, askpass
+  // environment assignments, input piped or heredoc-fed into a
+  // git credential invocation, and the body of a shell function a
+  // credential.helper value names. Only the hand-off span itself is
+  // scrubbed: the same token echoed to a log, or posted by a curl
+  // statement elsewhere in the step, keeps full exfil weight.
+  const configValueAfter = (from: number): TextRange | null => {
+    let i = from;
+    while (i < text.length && /\s/.test(text[i])) i++;
+    if (text[i] === "=" || text[i] === ":") {
+      i++;
+      while (i < text.length && /\s/.test(text[i])) i++;
+    }
+    if (i >= text.length) return null;
+    if (text[i] === "'" || text[i] === '"' || text[i] === "`") {
+      const end = consumeLiteral(text, i);
+      return end > i ? { start: i, end } : null;
+    }
+    let end = i;
+    while (end < text.length && !/[\s;"']/.test(text[end])) end++;
+    return end > i ? { start: i, end } : null;
+  };
+  const helperNames: string[] = [];
+  for (const m of text.matchAll(/\bcredential\.helper\b/gi)) {
+    const v = configValueAfter(m.index + m[0].length);
+    if (!v) continue;
+    ranges.push(v);
+    const rawVal = text.slice(v.start, v.end).replace(/^['"`]/, "").replace(/^!/, "");
+    const tok = rawVal.split(/\s+/)[0] ?? "";
+    if (/^[A-Za-z_][A-Za-z0-9_-]*$/.test(tok)) helperNames.push(tok);
+  }
+  for (const m of text.matchAll(/\bcore\.askpass\b/gi)) {
+    const v = configValueAfter(m.index + m[0].length);
+    if (v) ranges.push(v);
+  }
+  for (const m of text.matchAll(/\b(?:GIT_ASKPASS|SSH_ASKPASS|SUDO_ASKPASS)\s*=\s*/g)) {
+    const v = configValueAfter(m.index + m[0].length);
+    if (v) ranges.push(v);
+  }
+  // A shell function a credential.helper value names by bare word:
+  // its body is the helper program, so its echoed password lines are
+  // protocol output. Builtin helper names (cache, store, manager)
+  // simply have no definition in the text and match nothing.
+  for (const name of helperNames) {
+    const fnRe = new RegExp(`(?:^|[\\n;])\\s*(?:function\\s+)?${name}\\s*(?:\\(\\s*\\))?\\s*\\{`, "g");
+    let fm: RegExpExecArray | null;
+    while ((fm = fnRe.exec(text)) !== null) {
+      const brace = fm.index + fm[0].length - 1;
+      const end = consumeBalanced(text, brace);
+      if (end > fm.index) ranges.push({ start: fm.index, end });
+    }
+  }
+  // Input handed to a git credential invocation: every earlier
+  // segment of a pipeline whose later segment runs git credential
+  // is protocol input (protocol, host, username, password lines),
+  // not a disclosure to a log.
+  for (const stmt of splitShell(text, ["\n", ";", "&&", "||"])) {
+    const stmtText = text.slice(stmt.start, stmt.end);
+    const segs = splitShell(stmtText, ["|"]);
+    if (segs.length < 2) continue;
+    for (let k = 1; k < segs.length; k++) {
+      const segText = stmtText.slice(segs[k].start, segs[k].end);
+      if (!/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*(?:sudo\s+)?git\s+credential\b/.test(segText)) continue;
+      for (let e = 0; e < k; e++) {
+        ranges.push({ start: stmt.start + segs[e].start, end: stmt.start + segs[e].end });
+      }
+    }
+  }
+  // A heredoc feeding git credential is protocol input as well:
+  // the body up to the delimiter line is read by git as credential
+  // fields, never printed to a log.
+  for (const m of text.matchAll(/\bgit\s+credential\b[^\n]*<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/g)) {
+    const bodyStart = m.index + m[0].length;
+    const rest = text.slice(bodyStart);
+    const endMatch = rest.match(new RegExp(`\\n[ \\t]*${m[1]}\\b`));
+    if (endMatch && (endMatch.index ?? 0) > 0) {
+      ranges.push({ start: bodyStart, end: bodyStart + (endMatch.index ?? 0) });
+    }
   }
   // Dict and object entries: authentication header keys anywhere, and
   // any header-shaped key inside a headers construction.
