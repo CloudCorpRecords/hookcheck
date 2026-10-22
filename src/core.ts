@@ -8,7 +8,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type { Classification, HookFinding, HookSource, ScanReport, Verdict } from "./types.js";
 
-export const VERSION = "0.1.14";
+export const VERSION = "0.1.15";
 
 interface RuleDef {
   id: string;
@@ -2862,9 +2862,29 @@ function discoverSurfaces(root: string, warnings: string[]): Discovery {
     for (const name of entries) {
       if (skipDirs.has(name) || name.startsWith(".")) continue;
       const childAbs = join(cur.abs, name);
+      const childRel = cur.rel === "" ? name : `${cur.rel}/${name}`;
       let lst; try { lst = lstatSync(childAbs); } catch { continue; }
-      if (lst.isSymbolicLink() || !lst.isDirectory()) continue;
-      children.push({ abs: childAbs, rel: cur.rel === "" ? name : `${cur.rel}/${name}`, depth: cur.depth + 1 });
+      if (lst.isSymbolicLink()) {
+        // No-follow policy (P-074): a symlinked directory is never
+        // entered, but the skip is no longer silent. One warning per
+        // skipped directory names the path and the reason, when the
+        // link resolves to a directory (the container shape that can
+        // hold hook surfaces) or when a surface-shaped name cannot
+        // be resolved at all. A link to a regular file is not a
+        // directory container and is judged by the surface scanners
+        // at its own path, so it earns no warning here.
+        let targetIsDir = false;
+        let unresolved = false;
+        try { targetIsDir = statSync(childAbs).isDirectory(); } catch { unresolved = true; }
+        if (targetIsDir) {
+          warnings.push(`Symlinked directory skipped: ${childRel} is a symbolic link to a directory; symlinked directories are not followed, so any hook surfaces inside it were not inventoried`);
+        } else if (unresolved && SURFACE_DIR_INDICATORS.has(name)) {
+          warnings.push(`Symlinked directory skipped: ${childRel} is a symbolic link that could not be resolved; it was not inventoried`);
+        }
+        continue;
+      }
+      if (!lst.isDirectory()) continue;
+      children.push({ abs: childAbs, rel: childRel, depth: cur.depth + 1 });
     }
     if (cur.depth >= NESTED_MAX_DEPTH) {
       frontierDirs += children.length;
@@ -3007,8 +3027,21 @@ function scanClaude(root: string, findings: HookFinding[], warnings: string[], s
     const baseAbs = prefix === "" ? root : join(root, prefix);
     for (const rel of claudeSettingsCandidates(root, prefix)) {
       const abs = join(root, rel);
-      if (!existsSync(abs)) continue;
-      let st; try { st = statSync(abs); } catch { continue; }
+      // lstat first (P-074): a candidate that is absent is the normal
+      // case and stays silent, but a candidate that EXISTS in some
+      // form and cannot be examined (a symlink loop, a dangling
+      // link, an unreadable parent directory) was skipped silently
+      // before v0.1.15; it now warns by name, once per path.
+      let lst; try { lst = lstatSync(abs); } catch { continue; }
+      void lst;
+      let st; try { st = statSync(abs); } catch (err) {
+        if (!state.inventoried.has(rel)) {
+          state.inventoried.add(rel);
+          const code = (err as NodeJS.ErrnoException | undefined)?.code ?? "error";
+          warnings.push(`Unreadable surface skipped: ${rel} could not be examined (${code}); it was not inventoried`);
+        }
+        continue;
+      }
       if (st.isDirectory()) {
         if (!state.inventoried.has(rel)) {
           state.inventoried.add(rel);
@@ -3016,7 +3049,13 @@ function scanClaude(root: string, findings: HookFinding[], warnings: string[], s
         }
         continue;
       }
-      if (!st.isFile()) continue;
+      if (!st.isFile()) {
+        if (!state.inventoried.has(rel)) {
+          state.inventoried.add(rel);
+          warnings.push(`Non-regular surface skipped: ${rel} is not a regular file; it was not inventoried`);
+        }
+        continue;
+      }
       if (!claimFile(state, "settings", rel, prefix !== "")) continue;
       const data = readJson(root, rel, warnings) as Record<string, unknown> | null;
       if (!data || typeof data !== "object") continue;
@@ -3128,10 +3167,17 @@ function scanDirFiles(root: string, dirName: string, source: HookSource, family:
     }
     for (const name of entries.sort()) {
       const fileAbs = join(abs, name);
-      let st; try { st = statSync(fileAbs); } catch { continue; }
+      const fileRel = `${dirRel}/${name}`;
+      // An entry the directory listing proved exists but stat cannot
+      // examine (a dangling symlink, a symlink loop) was skipped
+      // silently before v0.1.15 (P-074); it now warns by name.
+      let st; try { st = statSync(fileAbs); } catch (err) {
+        const code = (err as NodeJS.ErrnoException | undefined)?.code ?? "error";
+        warnings.push(`Unreadable surface skipped: ${fileRel} could not be examined (${code}); it was not inventoried`);
+        continue;
+      }
       if (!st.isFile()) continue;
       if (name === "_" || name.startsWith(".")) continue;
-      const fileRel = `${dirRel}/${name}`;
       if (!claimFile(state, family, fileRel, prefix !== "")) continue;
       const content = readTextWarn(fileAbs, fileRel, warnings);
       if (content === null) continue;
@@ -3202,12 +3248,19 @@ function scanAgentDirs(root: string, findings: HookFinding[], warnings: string[]
       const abs = join(root, base, dir);
       if (!existsSync(abs)) continue;
       let entries: string[] = [];
-      try { entries = readdirSync(abs); } catch { continue; }
+      try { entries = readdirSync(abs); } catch {
+        warnings.push(`Unreadable directory skipped: ${base}${dir} could not be listed; the scan is partial`);
+        continue;
+      }
       for (const name of entries.sort()) {
         const fileAbs = join(abs, name);
-        let st; try { st = statSync(fileAbs); } catch { continue; }
-        if (!st.isFile()) continue;
         const rel = `${base}${dir}/${name}`;
+        let st; try { st = statSync(fileAbs); } catch (err) {
+          const code = (err as NodeJS.ErrnoException | undefined)?.code ?? "error";
+          warnings.push(`Unreadable surface skipped: ${rel} could not be examined (${code}); it was not inventoried`);
+          continue;
+        }
+        if (!st.isFile()) continue;
         // mcp.json is an MCP config surface, inventoried exactly once by
         // the central scanMcpFile pass in scanHooks (P-035). Running it
         // through the generic command walk here as well counted every
@@ -3310,7 +3363,15 @@ function scanOneWorkflow(root: string, rel: string, baseAbs: string, findings: H
     const rawFile = readTextWarn(join(root, rel), rel, warnings);
     if (rawFile === null) return;
     const raw = rawFile.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    const lines = raw.split("\n");
+    // Trailing whitespace is not YAML content (P-075): a line that
+    // differs from its twin only by trailing spaces must parse
+    // identically. Before v0.1.15 a map anchor line carrying only
+    // trailing whitespace after the anchor name matched the scalar
+    // anchor pattern with a whitespace "value", so the mapping
+    // anchor never registered, its definition run line was
+    // inventoried as a live step, and alias and merge-key steps
+    // resolved to an empty command at UNKNOWN.
+    const lines = raw.split("\n").map((l) => l.replace(/[ \t]+$/, ""));
     const indentOf = (l: string): number => l.length - l.trimStart().length;
     const unquote = (s: string): string => {
       const t = s.trim();
@@ -3352,7 +3413,7 @@ function scanOneWorkflow(root: string, rel: string, baseAbs: string, findings: H
 
     for (let idx = 0; idx < lines.length; idx++) {
       const line = lines[idx];
-      const scalarM = line.match(/^(\s*)(?:-\s*)?([A-Za-z0-9_-]+):\s*&([A-Za-z0-9_-]+)\s+(.+?)\s*$/);
+      const scalarM = line.match(/^(\s*)(?:-\s*)?([A-Za-z0-9_-]+):\s*&([A-Za-z0-9_-]+)\s+(\S.*?)\s*$/);
       if (scalarM && scalarM[2] !== "run") {
         scalarAnchors.set(scalarM[3], unquote(scalarM[4]));
         continue;
@@ -3414,6 +3475,11 @@ function scanOneWorkflow(root: string, rel: string, baseAbs: string, findings: H
       } else if (/^\*[A-Za-z0-9_-]+$/.test(rest)) {
         rest = resolveAlias(rest);
       }
+      // A plain quoted scalar is the same command as its unquoted
+      // form (P-076): run: "echo single-line" is echo single-line.
+      // Strip one pair of surrounding quotes before classification
+      // and storage, so both forms produce the identical finding.
+      rest = unquote(rest);
       const blockHeader = rest.match(/^([|>])([+-]?)\s*(#.*)?$/);
       if (blockHeader) {
         const { body, end } = collectBlock(idx, runIndent);
@@ -3431,6 +3497,72 @@ function scanOneWorkflow(root: string, rel: string, baseAbs: string, findings: H
 
 function scanGitHooks(root: string, findings: HookFinding[], warnings: string[], state: ScanState): void {
   scanDirFiles(root, ".githooks", "githooks", "githooks", findings, warnings, state);
+}
+
+/**
+ * SAFE finding aggregation (P-070). A single 5 MB workflow of about
+ * 92,000 repeated benign steps produced one finding record per step
+ * on 0.1.14: 91,980 findings, 35,390,354 bytes of JSON, 23.7 seconds
+ * of wall time on the published binary, nearly all of it inventory
+ * noise (every finding the same SAFE step). Repetition at that scale
+ * is one fact, not 92,000: when at least AGGREGATE_MIN identical
+ * SAFE findings (same file, source, hook, command, rules, and
+ * evidence) repeat, they collapse into a single aggregate record
+ * that keeps the first finding's id and line and carries count (the
+ * number folded in) and lastLine (the last folded line). Groups of
+ * two stay individual: a pair is ordinary inventory, not mass
+ * repetition.
+ *
+ * Only SAFE findings are ever aggregated. A RISKY or UNKNOWN finding
+ * is a per-occurrence fact (its line is where a human must look),
+ * and collapsing one could hide the one occurrence that matters.
+ * The verdict is computed on the full inventory BEFORE aggregation,
+ * so verdicts and exit codes are unchanged by the collapse; counts
+ * in the report describe the reported records, and the aggregation
+ * object preserves the pre-aggregation total and states the
+ * collapse in words, in JSON and in the human renderer. The
+ * collapse is never silent.
+ */
+export const AGGREGATE_MIN = 3;
+
+function aggregateSafeFindings(findings: HookFinding[]): { findings: HookFinding[]; aggregation?: ScanReport["aggregation"] } {
+  const keyOf = (f: HookFinding): string => [f.file, f.source, f.hook, f.command, f.classification, f.rules.join(","), f.evidence].join("\u0001");
+  const groups = new Map<string, number[]>();
+  findings.forEach((f, i) => {
+    if (f.classification !== "SAFE") return;
+    const key = keyOf(f);
+    const arr = groups.get(key) ?? [];
+    arr.push(i);
+    groups.set(key, arr);
+  });
+  let aggregateRecords = 0;
+  let collapsedFindings = 0;
+  const out: HookFinding[] = [];
+  findings.forEach((f, i) => {
+    if (f.classification !== "SAFE") { out.push(f); return; }
+    const idxs = groups.get(keyOf(f)) as number[];
+    if (idxs.length < AGGREGATE_MIN) { out.push(f); return; }
+    if (idxs[0] !== i) return; // folded into the group's first record
+    aggregateRecords++;
+    collapsedFindings += idxs.length - 1;
+    const last = findings[idxs[idxs.length - 1]];
+    out.push({
+      ...f,
+      count: idxs.length,
+      ...(last.line !== undefined && f.line !== undefined && last.line !== f.line ? { lastLine: last.line } : {}),
+    });
+  });
+  if (aggregateRecords === 0) return { findings: out };
+  const folded = collapsedFindings + aggregateRecords;
+  return {
+    findings: out,
+    aggregation: {
+      findingsBeforeAggregation: findings.length,
+      aggregateRecords,
+      collapsedFindings,
+      note: `${folded} identical SAFE findings were collapsed into ${aggregateRecords} counted aggregate record(s); ${collapsedFindings} finding record(s) were folded away. Only SAFE findings are aggregated; RISKY and UNKNOWN findings are always reported individually. The verdict was computed on the full inventory of ${findings.length} findings before aggregation, so the verdict and exit codes are unchanged.`,
+    },
+  };
 }
 
 /**
@@ -3512,27 +3644,34 @@ export function scanHooks(root: string): ScanReport {
     seen.add(key); return true;
   });
 
-  const counts = {
-    total: deduped.length,
-    safe: deduped.filter((f) => f.classification === "SAFE").length,
-    risky: deduped.filter((f) => f.classification === "RISKY").length,
-    unknown: deduped.filter((f) => f.classification === "UNKNOWN").length,
-  };
-  // Partial scan floor (P-049, extended by P-065): when any inventoried
-  // file or directory could not be read, when a file cap left surface
-  // files uninventoried, or when hook surfaces were spotted just below
-  // the discovery depth bound, the scan did not see the whole estate,
-  // so a bare CLEAN is not an honest verdict. Floor at REVIEW; the
-  // warnings name exactly what was missed.
+  // The verdict is computed on the full inventory, before any
+  // aggregation (P-070): collapsing repeated SAFE records for
+  // presentation must never move a verdict or an exit code.
   let verdict = computeVerdict(deduped);
-  if (verdict === "CLEAN" && (warnings.some((w) => w.startsWith("Unreadable")) || state.partial || disc.surfacesBelowBound > 0)) {
+  // Partial scan floor (P-049, extended by P-065 and P-074): when any
+  // inventoried file or directory could not be read, when a file cap
+  // left surface files uninventoried, when hook surfaces were
+  // spotted just below the discovery depth bound, or when a
+  // symlinked directory was skipped under the no-follow policy, the
+  // scan did not see the whole estate, so a bare CLEAN is not an
+  // honest verdict. Floor at REVIEW; the warnings name exactly what
+  // was missed.
+  if (verdict === "CLEAN" && (warnings.some((w) => w.startsWith("Unreadable") || w.startsWith("Symlinked directory skipped")) || state.partial || disc.surfacesBelowBound > 0)) {
     verdict = "REVIEW";
   }
+  const { findings: reported, aggregation } = aggregateSafeFindings(deduped);
+  const counts = {
+    total: reported.length,
+    safe: reported.filter((f) => f.classification === "SAFE").length,
+    risky: reported.filter((f) => f.classification === "RISKY").length,
+    unknown: reported.filter((f) => f.classification === "UNKNOWN").length,
+  };
   return {
     path: root,
     verdict,
-    findings: deduped,
+    findings: reported,
     counts,
+    ...(aggregation ? { aggregation } : {}),
     warnings,
     scannedAt: new Date().toISOString(),
     ...(counts.total === 0 ? { note: EMPTY_ESTATE_NOTE } : {}),
@@ -3563,9 +3702,12 @@ export function renderReport(report: ScanReport): string {
   const lines: string[] = [];
   lines.push(`hookcheck ${report.path}: ${report.verdict}`);
   lines.push(`  ${report.counts.total} hook(s): ${report.counts.safe} SAFE, ${report.counts.risky} RISKY, ${report.counts.unknown} UNKNOWN`);
+  if (report.aggregation) lines.push(`  aggregation: ${report.aggregation.note}`);
   if (report.note) lines.push(`  note: ${report.note}`);
   for (const f of report.findings) {
-    lines.push(`  [${f.classification}] ${f.id} (${f.source}${f.line !== undefined ? `, line ${f.line}` : ""})`);
+    const linePart = f.line !== undefined ? (f.lastLine !== undefined ? `, lines ${f.line}-${f.lastLine}` : `, line ${f.line}`) : "";
+    const countPart = f.count !== undefined ? `, count ${f.count}` : "";
+    lines.push(`  [${f.classification}] ${f.id} (${f.source}${linePart}${countPart})`);
     lines.push(`      command: ${f.command.slice(0, 200)}`);
     if (f.rules.length) lines.push(`      rules: ${f.rules.join(", ")}`);
     lines.push(`      evidence: ${f.evidence}`);

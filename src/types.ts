@@ -36,6 +36,17 @@ export interface HookFinding {
   command: string;
   /** 1-based line number of the hook inside its file, when known (workflow run steps). */
   line?: number;
+  /**
+   * Aggregation (P-070, v0.1.15): when at least 3 identical SAFE
+   * findings (same file, source, hook, command, rules, and evidence)
+   * repeat, they collapse into one aggregate record carrying count
+   * (the number of findings folded into it) and lastLine (the line
+   * of the last folded finding; line keeps the first). Only SAFE
+   * findings are ever aggregated. Absent on ordinary findings.
+   */
+  count?: number;
+  /** Line of the last finding folded into an aggregate record. */
+  lastLine?: number;
   classification: Classification;
   /** Rule ids that fired, e.g. ["NET-FETCH", "CRED-ACCESS"]. Empty for SAFE. */
   rules: string[];
@@ -48,6 +59,20 @@ export interface ScanReport {
   verdict: Verdict;
   findings: HookFinding[];
   counts: { total: number; safe: number; risky: number; unknown: number };
+  /**
+   * Aggregation summary (P-070, v0.1.15), present only when at
+   * least one group of identical SAFE findings was collapsed.
+   * counts reflect the reported records; findingsBeforeAggregation
+   * preserves the full inventory total, and the verdict was
+   * computed on that full inventory before aggregation. The note
+   * states the collapse in words so it is never silent.
+   */
+  aggregation?: {
+    findingsBeforeAggregation: number;
+    aggregateRecords: number;
+    collapsedFindings: number;
+    note: string;
+  };
   warnings: string[];
   scannedAt: string;
   /**
