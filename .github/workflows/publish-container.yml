@@ -1,0 +1,77 @@
+# Build and push the hookcheck container image to GHCR, then smoke test it.
+name: Publish container (GHCR)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push-test:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/cloudcorprecords/hookcheck
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+            TAG="${TAG#v}"
+          else
+            TAG="$(node -p "require('./package.json').version")"
+          fi
+          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "Image tags: latest, ${TAG}"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ steps.tag.outputs.version }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.tag.outputs.created }}
+
+      - name: Smoke test the published image
+        run: |
+          set -euo pipefail
+          IMG="${{ env.IMAGE }}:${{ steps.tag.outputs.version }}"
+          docker pull "$IMG"
+
+          # 1. MCP server: send an initialize JSON-RPC request over stdio
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0.0.0"}}}' | docker run -i --rm "$IMG" > init.json
+          python3 - <<'EOF'
+          import json
+          d = json.load(open('init.json'))
+          name = d['result']['serverInfo']['name']
+          version = d['result']['serverInfo'].get('version')
+          print("MCP initialize OK: serverInfo.name=" + name + " version=" + str(version))
+          assert name and 'hookcheck' in name.lower(), "unexpected server name: " + str(name)
+          EOF
+
+          # 2. CLI still reachable: an unknown command prints usage and exits 2
+          set +e
+          docker run --rm "$IMG" not-a-command > usage.txt 2>&1
+          code=$?
+          set -e
+          grep -q "Usage" usage.txt
+          [ "$code" -eq 2 ]
+          echo "CLI usage check OK (exit 2 with Usage)"
+
+          echo "Container smoke test passed for $IMG"
