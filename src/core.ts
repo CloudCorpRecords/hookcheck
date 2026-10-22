@@ -8,33 +8,141 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 import type { Classification, HookFinding, HookSource, ScanReport, Verdict } from "./types.js";
 
-export const VERSION = "0.1.1";
+export const VERSION = "0.1.2";
 
 interface RuleDef {
   id: string;
   pattern: RegExp;
   evidence: string;
-  /** True when this rule alone indicates remote code fetch. */
+  /** True when this rule indicates outbound network behavior. */
   remote?: boolean;
-  /** True when this rule indicates credential store access. */
+  /** True when this rule indicates credential store or credential shaped access. */
   credential?: boolean;
-  /** True when this pattern is severe enough on its own (decode and execute). */
+  /**
+   * True when this rule is strong evidence on its own: fetched or decoded
+   * content executed directly as code. Round 1 calibration (P-003, P-004):
+   * COMPROMISED-PATTERN requires strong evidence, either a severe rule, or
+   * credential access combined with network behavior in the same finding.
+   * A pile of weak signals (a URL alone, a localhost curl, an ordinary env
+   * read) is RISKY at most and verdicts REVIEW.
+   */
   severe?: boolean;
 }
 
 export const RISKY_RULES: RuleDef[] = [
-  { id: "DECODE-PIPE-SH", pattern: /\bbase64\s+(-d|--decode|-D)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh)\b/, evidence: "decodes a base64 payload and pipes it straight into a shell", severe: true },
-  { id: "CURL-PIPE-SH", pattern: /\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh)\b/, evidence: "pipes a network download straight into a shell", remote: true },
+  { id: "DECODE-PIPE-SH", pattern: /\bbase64\s+(-d|--decode|-D)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh|node|python3?|perl|ruby)\b/, evidence: "decodes a base64 payload and pipes it straight into an interpreter", severe: true, remote: true },
+  { id: "CURL-PIPE-SH", pattern: /\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(sh|bash|zsh|node|python3?|perl|ruby)\b/, evidence: "pipes a network download straight into an interpreter", severe: true, remote: true },
+  { id: "REMOTE-EVAL", pattern: /\beval\b[^;]{0,80}\b(curl|wget)\b|\beval\b[^;]{0,80}\$\(\s*(curl|wget)|\bFunction\s*\([^)]{0,80}(curl|wget|fetch)/, evidence: "evaluates content fetched from the network as code", severe: true, remote: true },
   { id: "NET-FETCH", pattern: /\b(curl|wget)\b|\bfetch\s*\(|https?\s*\.get\s*\(|requests\.(get|post)\b|Invoke-WebRequest\b|Invoke-RestMethod\b/, evidence: "performs a network fetch", remote: true },
   { id: "REMOTE-URL", pattern: /https?:\/\/[^\s"'`]+/, evidence: "references a remote URL", remote: true },
-  { id: "CRED-ACCESS", pattern: /~\/\.ssh|\$HOME\/\.ssh|\.aws\/|~\/\.aws|\.gnupg|id_rsa|id_ed25519|\.npmrc\b|\.netrc\b|credentials(\.json)?\b|\.config\/gh|keychain/i, evidence: "touches a credential store path", credential: true },
-  { id: "ENV-ACCESS", pattern: /process\.env|os\.environ|getenv\s*\(|\benv\b.*\b(print|export)|\$\{?\s*(AWS_SECRET|AWS_ACCESS|GITHUB_TOKEN|GH_TOKEN|NPM_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY)/, evidence: "reads environment variables that commonly hold secrets" },
-  { id: "ENV-EXFIL", pattern: /(process\.env|os\.environ)[\s\S]{0,80}(fetch|https?|request|post|send|upload)/i, evidence: "combines environment access with an outbound send pattern", credential: true, remote: true },
   { id: "OBFUSCATION", pattern: /base64\s+(-d|--decode)|atob\s*\(|Buffer\.from\s*\([^)]*base64|\\x[0-9a-fA-F]{2}|\beval\b\s*\(|\beval\b\s+["'$(]|Function\s*\(/, evidence: "uses decoding or dynamic evaluation often used to hide payloads" },
-  { id: "SHELL-EXEC", pattern: /\b(child_process|execSync|spawnSync|exec\s*\()\b|\/bin\/(sh|bash)\b|powershell(\.exe)?\b|cmd\.exe\b/, evidence: "spawns a shell or child process" },
   { id: "WRITE-OUTSIDE", pattern: /(>>?|tee)\s+~\/|(>>?|tee)\s+\$HOME\/|chmod\s+\+x/, evidence: "writes outside the repo or changes executable bits" },
   { id: "DOWNLOAD-EXEC", pattern: /\bnode\s+-e\b|\bpython3?\s+-c\b|\bdeno\s+eval\b|\bbun\s+-e\b/, evidence: "executes inline code supplied on the command line" },
 ];
+
+/**
+ * Rule metadata for procedurally detected rules (credential access and env
+ * access are computed, not regex matched, so they are not in RISKY_RULES).
+ * SHELL-EXEC is deliberately absent since v0.1.2 (P-006): spawning a child
+ * process or being a shell script is the normal state of a hook and is not
+ * a risky signal on its own; the target script contents are classified
+ * instead, one hop.
+ */
+const EXTRA_RULE_META: Record<string, { remote?: boolean; credential?: boolean; severe?: boolean }> = {
+  "CRED-ACCESS": { credential: true },
+  "ENV-ACCESS": { credential: true },
+  "ENV-BULK": { credential: true },
+  "ENV-EXFIL": { credential: true, remote: true },
+};
+
+function ruleMeta(id: string): { remote?: boolean; credential?: boolean; severe?: boolean } {
+  const r = RISKY_RULES.find((x) => x.id === id);
+  if (r) return r;
+  return EXTRA_RULE_META[id] ?? {};
+}
+
+/**
+ * Strip comments before classification: block comments anywhere, and full
+ * line comments (// or #) in shell, JS, and Python style files. A docs URL
+ * inside a comment is not a fetch (P-003, puppeteer), and shell comments do
+ * not execute. String literals containing comment markers on a code line
+ * are untouched.
+ */
+export function stripComments(text: string): string {
+  return text
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n")
+    .filter((l) => {
+      const t = l.trim();
+      return !t.startsWith("//") && !t.startsWith("#");
+    })
+    .join("\n");
+}
+
+const CRED_FILE_PATTERNS: RegExp[] = [
+  /~\/\.ssh(\/|\s|$|["'])/, /\$HOME\/\.ssh(\/|\s|$|["'])/, /(^|[\s"'(=])\.ssh\//,
+  /\.aws\/credentials\b/, /\.aws\/config\b/,
+  /~\/\.gnupg(\/|\s|$|["'])/, /\$HOME\/\.gnupg(\/|\s|$|["'])/, /\/\.gnupg\//,
+  /(^|[\s"'(=\/])(id_rsa|id_ed25519|id_ecdsa|id_dsa)(\.pub)?\b/,
+  /\.npmrc\b/, /\.netrc\b/,
+  /credentials\.(json|ya?ml|toml|ini|xml|env)\b/,
+  /(^|[\s"'(=\/])credentials(?=$|[\s;|&)"'])/,
+  /\/\.config\/gh\//,
+  /find-generic-password|find-internet-password/,
+  /(homedir\(\)|Path\.home\(\)|expanduser\()\s*[,+]\s*["'][^"']*\.(ssh|aws|gnupg)/,
+];
+
+/**
+ * Credential store access, matched on content and paths (P-004). Script
+ * filenames are scrubbed first: a hook that runs a script named like
+ * configure_git_credentials.sh is classified by that script's contents
+ * (one hop), never by the word credentials inside its filename.
+ */
+function detectCredAccess(cmd: string): boolean {
+  const scrubbed = cmd.replace(/[A-Za-z0-9_.\/-]+\.(?:sh|bash|zsh|mjs|cjs|js|ts|py|ps1)\b/g, " ");
+  return CRED_FILE_PATTERNS.some((p) => p.test(scrubbed));
+}
+
+const CRED_ENV_NAME = /(SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|ACCESS_?KEY|CREDENTIAL|AUTH_?KEY|SESSION_?KEY)/i;
+
+/**
+ * Env access calibration (P-005). Ordinary single named reads
+ * (process.env.NODE_ENV, os.environ.get("HOME")) are not flagged at all.
+ * Only credential shaped names (token, secret, password, api key, and
+ * friends, in any access syntax) and bulk access (whole object
+ * serialization, printenv, bare env dumps, whole os.environ use) count.
+ */
+function detectEnvAccess(cmd: string): { cred: boolean; bulk: boolean } {
+  let cred = false;
+  let bulk = false;
+  const nameRes = [
+    /process\.env\.([A-Za-z_][A-Za-z0-9_]*)/g,
+    /process\.env\[["']([A-Za-z_][A-Za-z0-9_]*)["']\]/g,
+    /os\.environ\.get\(["']([A-Za-z_][A-Za-z0-9_]*)["']/g,
+    /os\.environ\[["']([A-Za-z_][A-Za-z0-9_]*)["']\]/g,
+    /getenv\(["']([A-Za-z_][A-Za-z0-9_]*)["']/g,
+    /Deno\.env\.get\(["']([A-Za-z_][A-Za-z0-9_]*)["']/g,
+    /import\.meta\.env\.([A-Za-z_][A-Za-z0-9_]*)/g,
+    /\$\{?([A-Z][A-Z0-9_]{2,})\}?/g,
+  ];
+  for (const re of nameRes) {
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(cmd)) !== null) {
+      if (CRED_ENV_NAME.test(m[1])) cred = true;
+    }
+  }
+  if (/(JSON\.stringify|Object\.(keys|values|entries|assign)|util\.inspect)\s*\([^)]*process\.env/.test(cmd)) bulk = true;
+  if (/\bprintenv\b/.test(cmd)) bulk = true;
+  if (/(^|[;&|]\s*)env\s*($|[|>;])/.test(cmd)) bulk = true;
+  if (/\b(str|dict|list)\s*\(\s*os\.environ\s*\)/.test(cmd)) bulk = true;
+  if (/\bos\.environ\b(?!\s*(\.get\s*\(|\[))/.test(cmd)) bulk = true;
+  return { cred, bulk };
+}
+
+function isLoopbackHost(host: string): boolean {
+  const h = host.toLowerCase();
+  return h === "localhost" || h === "127.0.0.1" || h === "0.0.0.0" || h === "::1" || h === "[::1]";
+}
 
 const SAFE_PATTERNS: RegExp[] = [
   /^(npm|npx|yarn|pnpm|bun)\s+(run\s+)?(test|lint|build|dev|start|typecheck|check|format|prepare:.*|prepublishOnly.*)$/i,
@@ -47,13 +155,38 @@ const SAFE_PATTERNS: RegExp[] = [
 ];
 
 export function classifyCommand(command: string): { classification: Classification; rules: string[]; evidence: string } {
-  // Normalize shell line continuations and stray carriage returns first, so a
+  // Strip comments first (a docs URL in a comment is not a fetch), then
+  // normalize shell line continuations and stray carriage returns, so a
   // payload split as `curl ... \` + newline + `| sh` classifies the same as
   // the one line form.
-  const cmd = command.replace(/\\\r?\n/g, " ").replace(/\r/g, " ").trim();
-  const fired: RuleDef[] = [];
+  const cmd = stripComments(command).replace(/\\\r?\n/g, " ").replace(/\r/g, " ").replace(/\n/g, " ").trim();
+  const fired: Array<{ id: string; evidence: string }> = [];
   for (const rule of RISKY_RULES) {
-    if (rule.pattern.test(cmd)) fired.push(rule);
+    if (rule.pattern.test(cmd)) fired.push({ id: rule.id, evidence: rule.evidence });
+  }
+  // Loopback downgrade (P-004): a fetch whose every URL is loopback is a
+  // local health check shape, not a network exfil shape. Downgrade only
+  // when no severe rule fired.
+  const hosts = Array.from(cmd.matchAll(/https?:\/\/([^\s"'`\/:?#]+)/g)).map((m) => m[1]);
+  if (hosts.length > 0 && hosts.every(isLoopbackHost) && !fired.some((f) => ruleMeta(f.id).severe)) {
+    for (let i = fired.length - 1; i >= 0; i--) {
+      if (fired[i].id === "NET-FETCH" || fired[i].id === "REMOTE-URL") fired.splice(i, 1);
+    }
+  }
+  // Credential store access, content and path based (P-004).
+  if (detectCredAccess(cmd)) {
+    fired.push({ id: "CRED-ACCESS", evidence: "touches a credential store path or credential file" });
+  }
+  // Env access, credential shaped names or bulk only (P-005).
+  const env = detectEnvAccess(cmd);
+  if (env.cred) {
+    fired.push({ id: "ENV-ACCESS", evidence: "reads an environment variable whose name is credential shaped (token, secret, password, api key)" });
+  }
+  if (env.bulk) {
+    fired.push({ id: "ENV-BULK", evidence: "accesses the whole environment at once (serialization, printenv, or env dump)" });
+  }
+  if ((env.cred || env.bulk) && (fired.some((f) => f.id === "NET-FETCH" || f.id === "REMOTE-URL") || /\b(nc|netcat)\b/.test(cmd))) {
+    fired.push({ id: "ENV-EXFIL", evidence: "combines credential shaped or bulk environment access with an outbound send pattern" });
   }
   if (fired.length > 0) {
     return {
@@ -96,7 +229,7 @@ function escalateWithLocalFile(root: string, finding: HookFinding): HookFinding 
     if (!st.isFile()) continue;
     let content = "";
     try { content = readFileSync(abs, "utf8").slice(0, 200000); } catch { continue; }
-    const inner = classifyCommand(content.replace(/\n/g, " "));
+    const inner = classifyCommand(content);
     if (inner.classification === "RISKY") {
       const rules = Array.from(new Set([...out.rules, ...inner.rules]));
       out = {
@@ -147,14 +280,27 @@ function escalateWithScriptChain(root: string, scripts: Record<string, unknown>,
   return out;
 }
 
+/**
+ * Verdict calibration (Round 1, P-003 and P-004). COMPROMISED-PATTERN
+ * requires strong evidence inside a single finding:
+ *   (a) a severe rule: fetched or decoded content executed directly as
+ *       code (curl piped to an interpreter, base64 decode piped to an
+ *       interpreter, eval of fetched content), or
+ *   (b) credential evidence (credential store access, a credential shaped
+ *       env name, or bulk env access) combined with network behavior.
+ * Weak signals alone (a remote URL, a localhost fetch, an ordinary env
+ * read, a download by itself) classify RISKY at most, and a RISKY-only
+ * estate verdicts REVIEW, never COMPROMISED-PATTERN.
+ */
 export function computeVerdict(findings: HookFinding[]): Verdict {
   let review = false;
   for (const f of findings) {
     if (f.classification === "RISKY") {
-      const hasRemote = f.rules.some((id) => RISKY_RULES.find((r) => r.id === id)?.remote);
-      const hasCred = f.rules.some((id) => RISKY_RULES.find((r) => r.id === id)?.credential);
-      const hasSevere = f.rules.some((id) => RISKY_RULES.find((r) => r.id === id)?.severe);
-      if (hasRemote || hasCred || hasSevere) return "COMPROMISED-PATTERN";
+      const metas = f.rules.map(ruleMeta);
+      const hasSevere = metas.some((x) => x.severe);
+      const hasCred = metas.some((x) => x.credential);
+      const hasNet = metas.some((x) => x.remote);
+      if (hasSevere || (hasCred && hasNet)) return "COMPROMISED-PATTERN";
       review = true;
     } else if (f.classification === "UNKNOWN") {
       review = true;
@@ -163,11 +309,12 @@ export function computeVerdict(findings: HookFinding[]): Verdict {
   return review ? "REVIEW" : "CLEAN";
 }
 
-function makeFinding(root: string, file: string, source: HookSource, hook: string, command: string, idSuffix?: string): HookFinding {
+function makeFinding(root: string, file: string, source: HookSource, hook: string, command: string, idSuffix?: string, line?: number): HookFinding {
   const c = classifyCommand(command);
   const id = `${file}:${hook}${idSuffix !== undefined ? `:${idSuffix}` : ""}`;
   const base: HookFinding = {
     id, file, source, hook, command,
+    ...(line !== undefined ? { line } : {}),
     classification: c.classification, rules: c.rules,
     evidence: c.evidence,
   };
@@ -241,9 +388,41 @@ function collectClaudeHooks(node: unknown, file: string, root: string, findings:
   }
 }
 
+/**
+ * Claude settings locations (P-007). Beyond the standard .claude dir:
+ * the GNU stow layout used by real dotfiles repos (claude/settings.json,
+ * no dot), and a settings file nested one level under a config dir
+ * (config/.claude/settings.json). A settings path that exists as a
+ * directory is reported as a warning, never silently skipped.
+ */
+function claudeSettingsCandidates(root: string): string[] {
+  const rels = [
+    ".claude/settings.json", ".claude/settings.local.json",
+    "claude/settings.json", "claude/settings.local.json",
+  ];
+  let entries: string[] = [];
+  try { entries = readdirSync(root); } catch { entries = []; }
+  for (const name of entries.sort()) {
+    if (name === "node_modules" || name === ".git") continue;
+    let st; try { st = statSync(join(root, name)); } catch { continue; }
+    if (!st.isDirectory()) continue;
+    for (const f of ["settings.json", "settings.local.json"]) {
+      rels.push(`${name}/.claude/${f}`);
+    }
+  }
+  return Array.from(new Set(rels));
+}
+
 function scanClaude(root: string, findings: HookFinding[], warnings: string[]): void {
-  for (const rel of [".claude/settings.json", ".claude/settings.local.json"]) {
-    if (!existsSync(join(root, rel))) continue;
+  for (const rel of claudeSettingsCandidates(root)) {
+    const abs = join(root, rel);
+    if (!existsSync(abs)) continue;
+    let st; try { st = statSync(abs); } catch { continue; }
+    if (st.isDirectory()) {
+      warnings.push(`${rel} is a directory, not a settings file: any hooks inside it cannot be parsed as Claude settings`);
+      continue;
+    }
+    if (!st.isFile()) continue;
     const data = readJson(root, rel, warnings) as Record<string, unknown> | null;
     if (!data || typeof data !== "object") continue;
     if (!("hooks" in data)) { warnings.push(`No hooks key in ${rel}`); continue; }
@@ -413,6 +592,14 @@ function scanMcpFile(root: string, rel: string, findings: HookFinding[], warning
   }
 }
 
+/**
+ * Workflow run steps (P-002). Both single line run values and block
+ * scalars are inventoried. Block scalars (run: |, run: >, with the |-
+ * and >- and |+ chomping variants) are the dominant style for real
+ * multi-line steps; their bodies are collected by indentation, dedented,
+ * and classified exactly like the same commands on one line. Every
+ * finding carries the 1-based line number of its run: key.
+ */
 function scanWorkflows(root: string, findings: HookFinding[]): void {
   const dir = ".github/workflows";
   const abs = join(root, dir);
@@ -423,12 +610,40 @@ function scanWorkflows(root: string, findings: HookFinding[]): void {
     if (!/\.(yml|yaml)$/.test(name)) continue;
     const rel = `${dir}/${name}`;
     const raw = readText(join(root, rel)) ?? "";
-    const runRe = /^\s*-?\s*run:\s*(.+)$/gm;
-    let m: RegExpExecArray | null; let i = 0;
-    while ((m = runRe.exec(raw)) !== null) {
-      const cmd = m[1].trim();
-      if (cmd === "|" || cmd === ">" || cmd === "") continue;
-      findings.push(makeFinding(root, rel, "github-workflow", "run", cmd, String(i++)));
+    const lines = raw.split("\n");
+    let i = 0;
+    for (let idx = 0; idx < lines.length; idx++) {
+      const m = lines[idx].match(/^(\s*)-?\s*run:\s*(.*)$/);
+      if (!m) continue;
+      const runIndent = m[1].length;
+      const rest = m[2].trim();
+      const lineNo = idx + 1;
+      const blockHeader = rest.match(/^([|>])([+-]?)\s*(#.*)?$/);
+      if (blockHeader) {
+        // Collect body lines: blank lines belong to the block; the block
+        // ends at the first non-blank line indented at or below run:.
+        const body: string[] = [];
+        let j = idx + 1;
+        for (; j < lines.length; j++) {
+          const l = lines[j];
+          if (l.trim() === "") { body.push(""); continue; }
+          const indent = l.length - l.trimStart().length;
+          if (indent <= runIndent) break;
+          body.push(l);
+        }
+        const nonBlank = body.filter((l) => l.trim() !== "");
+        if (nonBlank.length > 0) {
+          const minIndent = Math.min(...nonBlank.map((l) => l.length - l.trimStart().length));
+          const dedented = body.map((l) => (l.trim() === "" ? "" : l.slice(minIndent))).join("\n").trim();
+          if (dedented) {
+            findings.push(makeFinding(root, rel, "github-workflow", "run", dedented, String(i++), lineNo));
+          }
+        }
+        idx = j - 1;
+        continue;
+      }
+      if (rest === "") continue;
+      findings.push(makeFinding(root, rel, "github-workflow", "run", rest, String(i++), lineNo));
     }
   }
 }
@@ -518,7 +733,7 @@ export function renderReport(report: ScanReport): string {
   lines.push(`hookcheck ${report.path}: ${report.verdict}`);
   lines.push(`  ${report.counts.total} hook(s): ${report.counts.safe} SAFE, ${report.counts.risky} RISKY, ${report.counts.unknown} UNKNOWN`);
   for (const f of report.findings) {
-    lines.push(`  [${f.classification}] ${f.id} (${f.source})`);
+    lines.push(`  [${f.classification}] ${f.id} (${f.source}${f.line !== undefined ? `, line ${f.line}` : ""})`);
     lines.push(`      command: ${f.command.slice(0, 200)}`);
     if (f.rules.length) lines.push(`      rules: ${f.rules.join(", ")}`);
     lines.push(`      evidence: ${f.evidence}`);
@@ -526,7 +741,7 @@ export function renderReport(report: ScanReport): string {
   for (const w of report.warnings) lines.push(`  [warn] ${w}`);
   if (report.verdict === "CLEAN") lines.push("CLEAN: no risky or unknown auto-exec hooks found.");
   else if (report.verdict === "REVIEW") lines.push("REVIEW: at least one hook needs manual review.");
-  else lines.push("COMPROMISED-PATTERN: at least one risky hook fetches remote code or touches credential stores. Treat as a Shai-Hulud style persistence pattern until proven otherwise.");
+  else lines.push("COMPROMISED-PATTERN: at least one risky hook shows strong evidence: fetched or decoded content executed as code, or credential access combined with network behavior. Treat as a Shai-Hulud style persistence pattern until proven otherwise.");
   return lines.join("\n");
 }
 

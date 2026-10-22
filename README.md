@@ -15,27 +15,27 @@ Reports in October 2026 described AI agents orchestrating attacks and a self-pro
 | surface | what it looks for |
 | --- | --- |
 | `package.json` | preinstall, install, postinstall, prepare scripts |
-| `.claude/settings.json` and `settings.local.json` | SessionStart, PreToolUse, and other hook commands |
+| `.claude/settings.json` and `settings.local.json` | SessionStart, PreToolUse, and other hook commands. Also discovered: the GNU stow layout (`claude/settings.json`, no dot) and settings nested one level under a config dir (for example `config/.claude/settings.json`). A settings path that exists as a directory is reported as a warning, not silently skipped |
 | `.vscode/tasks.json` | tasks with runOn folderOpen, plus task inventory |
 | `.husky/` | every hook file and its full command content |
 | `lefthook.yml` | run commands |
 | `.pre-commit-config.yaml` | entry commands and remote repo URLs |
 | `.cursor/` and `.codex/` | config commands and files |
 | MCP configs | `.mcp.json`, `mcp.json`, `.vscode/mcp.json`, `.cursor/mcp.json` servers that autostart |
-| `.github/workflows/` | run steps, as inventory |
+| `.github/workflows/` | run steps, as inventory, including block scalar bodies (`run: |` and `run: >`, with chomping variants). Every workflow finding carries the line number of its `run:` key |
 | `.githooks/` | hook files |
 
 Classification per hook:
 
 - **SAFE**: matches known safe dev patterns such as test, lint, build, typecheck, husky, or lint-staged, and matches no risky rule.
-- **RISKY**: matches at least one risky rule: network fetch, curl piped to a shell, base64 decode piped to a shell, credential store paths such as ~/.ssh or ~/.aws, environment secret access, base64 decoding or eval style obfuscation, shell spawning, inline code execution, or a remote URL.
+- **RISKY**: matches at least one risky rule: network fetch, curl piped to an interpreter, base64 decode piped to an interpreter, credential store paths or credential files (matched on content and paths, never on a script filename that merely contains the word credentials), credential shaped environment names (token, secret, password, api key) or bulk environment access, base64 decoding or eval style obfuscation, inline code execution, or a remote URL. Ordinary single named environment reads (NODE_ENV, HOME, RUNNER_DEBUG) are not flagged. A hook whose target is a shell script is classified by that script's contents, not by the fact that it is a shell script. Comments are stripped before classification, so a docs URL inside a comment is not a fetch, and a fetch whose every URL is loopback (a localhost health check) is not treated as network behavior.
 - **UNKNOWN**: matches neither safe nor risky patterns. A local script name alone is UNKNOWN until a human reads it. When a hook runs a local file such as `node setup.mjs`, hookcheck reads that file and escalates the finding if the file itself matches risky rules. The same one hop following applies to direct script execution (`./setup.sh`), `node --require ./setup.mjs`, and package.json script chains (`postinstall: npm run other-script`).
 
 Verdict rules:
 
 - **CLEAN**: every finding is SAFE, or no hooks were found. Exit code 0.
-- **REVIEW**: at least one UNKNOWN finding, or a RISKY finding without a remote fetch, credential, or decode-and-execute rule. Exit code 1.
-- **COMPROMISED-PATTERN**: at least one RISKY finding that fetches remote code, touches credential stores, or decodes a payload into a shell. This is the Shai-Hulud persistence shape. Treat the repo as untrusted until proven otherwise. Exit code 1.
+- **REVIEW**: at least one UNKNOWN finding, or a RISKY finding whose evidence is weak on its own (a remote URL alone, a download by itself, credential access with no network behavior). Exit code 1.
+- **COMPROMISED-PATTERN**: at least one RISKY finding with strong evidence: fetched or decoded content executed directly as code (curl piped to an interpreter, base64 decode piped to an interpreter, eval of fetched content), or credential access combined with network behavior in the same finding. This is the Shai-Hulud persistence shape. Treat the repo as untrusted until proven otherwise. Exit code 1. Canonical legitimate installers that download their own binary (esbuild, puppeteer) verdict REVIEW under this calibration, not COMPROMISED-PATTERN; the download is reported as a RISKY finding with its evidence, and the top verdict no longer over-claims it.
 
 Every finding reports file, hook id, command text, classification, rule ids, and evidence. Malformed JSON is reported as a warning, never silently ignored. Scanning a path that does not exist, or that is a file instead of a directory, is a clean error with exit code 2.
 
@@ -49,7 +49,9 @@ Honest boundaries, pinned by tests in test/hardening.test.ts:
 - Duplicate JSON keys resolve last-wins, exactly as JSON.parse, Node, and npm resolve them, so the scanner sees the same value that would actually run.
 - Non-string package.json script values are skipped: npm only executes string script values, so an array or number in scripts cannot auto-run.
 - Classification reads up to 200,000 characters of a hook file or a referenced local file. Beyond that depth a payload can hide; the cap exists so a hostile file cannot make the scan unbounded.
-- GitHub workflow run steps in block scalars (`run: |`) are inventoried only when they appear as single line run values; multi-line block scalar bodies are not parsed yet.
+- GitHub workflow run steps in block scalars (`run: |`, `run: >`, and chomping variants) are parsed and classified like one line commands. Plain multi-line scalars without a block header are not joined, and YAML anchors and reusable workflow internals are not resolved.
+- Agent config coverage boundaries: `.gemini/settings.json` is not scanned yet. Template configs (for example `templates/settings.json.template`) are not scanned: they are inert until copied into place, at which point the copied file is scanned under its real name.
+- UNKNOWN is the dominant classification on large real repos (measured at roughly 80 percent of findings on langfuse and cli/cli in Round 1 validation). The classifications are inventory, not suspicion: a REVIEW verdict on a large estate means the auto-exec surface is mapped and needs human triage, and the per finding evidence says exactly what each hook runs. More workflow step patterns will be classified over time; until then hookcheck does not guess.
 
 ## Usage
 
@@ -69,9 +71,9 @@ hookcheck ./some-repo: COMPROMISED-PATTERN
   2 hook(s): 0 SAFE, 2 RISKY, 0 UNKNOWN
   [RISKY] package.json:postinstall (package.json)
       command: node setup.mjs
-      rules: NET-FETCH, ENV-ACCESS
+      rules: NET-FETCH, REMOTE-URL, ENV-BULK, ENV-EXFIL
       evidence: referenced local file setup.mjs is RISKY: NET-FETCH: performs a network fetch
-COMPROMISED-PATTERN: at least one risky hook fetches remote code or touches credential stores.
+COMPROMISED-PATTERN: at least one risky hook shows strong evidence: fetched or decoded content executed as code, or credential access combined with network behavior.
 ```
 
 ### MCP server

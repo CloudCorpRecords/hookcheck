@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.2 (2026-10-22)
+
+Round 1 real-repo validation fixes (validation/problems.md P-002 to P-007, plus the P-015 and P-016 documentation limits). Every fix has a regression test built from the Round 1 evidence in test/round1.test.ts (26 tests, 105 total). Measured with the published 0.1.0 binary on real repos, real package trees (esbuild, puppeteer), and real agent config repos before the fix.
+
+- P-002 BLOCKER: GitHub workflow block scalar run steps (run: | and run: >, including |- and >- and |+ chomping variants) were not inventoried at all; a repo whose only run step was a block scalar reported total 0, CLEAN. Block bodies are now collected by indentation, dedented, and classified exactly like one line commands, and every workflow finding carries the line number of its run: key.
+- P-003 and P-004 calibration: COMPROMISED-PATTERN now requires strong evidence in a single finding: fetched or decoded content executed directly as code (curl or base64 decode piped to an interpreter, eval of fetched content), or credential access combined with network behavior. Weak signals alone (a remote URL, a download by itself, credential access with no send) verdict REVIEW. The canonical legitimate installers esbuild and puppeteer, and the real estates langfuse and cli/cli, no longer verdict COMPROMISED-PATTERN on pattern soup.
+- P-004: CRED-ACCESS is matched on content and credential paths, never on substrings of script filenames: a gh-aw step running configure_git_credentials.sh no longer fires it. Comments are stripped before classification (a docs URL in a comment is not a fetch), and a fetch whose every URL is loopback is downgraded (localhost health checks are not network exfil shapes).
+- P-005: ENV-ACCESS fires only on credential shaped env names (token, secret, password, api key, and friends, in any access syntax) or bulk access (whole object serialization such as JSON.stringify(process.env), printenv, bare env dumps, whole os.environ use), reported as ENV-ACCESS and ENV-BULK. Ordinary single named reads (NODE_ENV, HOME, RUNNER_DEBUG, ESBUILD_BINARY_PATH, npm_config_user_agent) are not flagged.
+- P-006: SHELL-EXEC removed. Being a shell script, or spawning a child process, is the normal state of a hook and no longer escalates a finding to RISKY on its own; a hook is classified by its target script's contents, one hop. A svelte-kit style pre-push running pnpm install, lint, and check is no longer RISKY.
+- P-007: Claude settings discovery covers the GNU stow layout (claude/settings.json, no dot, as in real dotfiles repos) and settings nested one level under a config dir (config/.claude/settings.json). A settings path that exists as a directory now produces an explicit warning instead of a silent skip.
+- P-015 and P-016 documented in the README limits: .gemini/settings.json is not scanned yet, template configs are inert and not scanned, and UNKNOWN dominance on large real estates is stated with its measured share.
+
 ## 0.1.1 (2026-10-21)
 
 Hardening pass. Every fix below was found by an adversarial battery test that failed against 0.1.0 first; the battery lives in test/hardening.test.ts (44 tests, 78 total).

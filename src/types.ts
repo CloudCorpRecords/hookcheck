@@ -33,6 +33,8 @@ export interface HookFinding {
   hook: string;
   /** Exact command text that would auto-execute. */
   command: string;
+  /** 1-based line number of the hook inside its file, when known (workflow run steps). */
+  line?: number;
   classification: Classification;
   /** Rule ids that fired, e.g. ["NET-FETCH", "CRED-ACCESS"]. Empty for SAFE. */
   rules: string[];

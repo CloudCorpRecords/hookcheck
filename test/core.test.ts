@@ -60,11 +60,14 @@ describe("computeVerdict", () => {
   it("REVIEW when unknown present", () => {
     assert.equal(computeVerdict([{ id: "a", file: "f", source: "package.json", hook: "h", command: "x", classification: "UNKNOWN", rules: [], evidence: "" }]), "REVIEW");
   });
-  it("COMPROMISED when risky has remote rule", () => {
-    assert.equal(computeVerdict([{ id: "a", file: "f", source: "package.json", hook: "h", command: "x", classification: "RISKY", rules: ["NET-FETCH"], evidence: "" }]), "COMPROMISED-PATTERN");
+  it("REVIEW when risky has only a remote rule (Round 1 calibration P-004: weak signal alone)", () => {
+    assert.equal(computeVerdict([{ id: "a", file: "f", source: "package.json", hook: "h", command: "x", classification: "RISKY", rules: ["NET-FETCH"], evidence: "" }]), "REVIEW");
   });
-  it("COMPROMISED when risky has credential rule", () => {
-    assert.equal(computeVerdict([{ id: "a", file: "f", source: "package.json", hook: "h", command: "x", classification: "RISKY", rules: ["CRED-ACCESS"], evidence: "" }]), "COMPROMISED-PATTERN");
+  it("REVIEW when risky has only a credential rule (Round 1 calibration P-004: weak signal alone)", () => {
+    assert.equal(computeVerdict([{ id: "a", file: "f", source: "package.json", hook: "h", command: "x", classification: "RISKY", rules: ["CRED-ACCESS"], evidence: "" }]), "REVIEW");
+  });
+  it("COMPROMISED when credential access combines with network behavior in one finding", () => {
+    assert.equal(computeVerdict([{ id: "a", file: "f", source: "package.json", hook: "h", command: "x", classification: "RISKY", rules: ["CRED-ACCESS", "NET-FETCH"], evidence: "" }]), "COMPROMISED-PATTERN");
   });
   it("REVIEW when risky has only shell exec", () => {
     assert.equal(computeVerdict([{ id: "a", file: "f", source: "package.json", hook: "h", command: "x", classification: "RISKY", rules: ["SHELL-EXEC"], evidence: "" }]), "REVIEW");
@@ -169,9 +172,15 @@ describe("scanHooks sources", () => {
     assert.equal(r.verdict, "REVIEW");
     assert.ok(r.warnings.length >= 1);
   });
-  it("credential access in postinstall verdicts COMPROMISED", () => {
+  it("credential access alone in postinstall is RISKY but verdicts REVIEW (Round 1 calibration P-004)", () => {
+    // Reading a credential file with no network or exfil behavior in the
+    // same finding is a weak signal on its own: RISKY finding, REVIEW
+    // verdict. Combined with a send it verdicts COMPROMISED (round1 tests).
     const dir = fx({ "package.json": JSON.stringify({ scripts: { postinstall: "cat ~/.aws/credentials" } }) });
-    assert.equal(scanHooks(dir).verdict, "COMPROMISED-PATTERN");
+    const r = scanHooks(dir);
+    assert.equal(r.findings[0].classification, "RISKY");
+    assert.ok(r.findings[0].rules.includes("CRED-ACCESS"));
+    assert.equal(r.verdict, "REVIEW");
   });
   it("every finding carries file, command, classification, rules, evidence fields", () => {
     const dir = fx({ "package.json": JSON.stringify({ scripts: { postinstall: "curl https://e.example/x" } }) });
