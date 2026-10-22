@@ -122,7 +122,11 @@ describe("P-003 and P-004: COMPROMISED-PATTERN requires strong evidence", () => 
   });
   it("computeVerdict: credential access combined with network behavior is COMPROMISED", () => {
     assert.equal(computeVerdict([finding({ rules: ["CRED-ACCESS", "NET-FETCH"] })]), "COMPROMISED-PATTERN");
-    assert.equal(computeVerdict([finding({ rules: ["ENV-ACCESS", "REMOTE-URL"] })]), "COMPROMISED-PATTERN");
+    // Round 2 recalibration (P-018): an env NAME reference plus a URL is
+    // the shape of a repo's own authenticated automation and no longer
+    // verdicts COMPROMISED on its own; the flow verified ENV-EXFIL rule
+    // still does. The Round 2 expectations live in test/round2.test.ts.
+    assert.equal(computeVerdict([finding({ rules: ["ENV-ACCESS", "REMOTE-URL"] })]), "REVIEW");
     assert.equal(computeVerdict([finding({ rules: ["ENV-EXFIL"] })]), "COMPROMISED-PATTERN");
   });
   it("computeVerdict: pipe to shell rules stay COMPROMISED on their own", () => {

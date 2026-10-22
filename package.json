@@ -1,1 +1,41 @@
-{"bin":{"hookcheck":"dist/cli.js"},"dependencies":{"@modelcontextprotocol/sdk":"^1","zod":"^3"},"description":"AI persistence hook auditor: scan a repo for auto-exec hooks (npm install scripts, Claude Code hooks, VS Code folderOpen tasks, husky, MCP autostart) and flag Shai-Hulud style persistence patterns.","devDependencies":{"@types/node":"^20","tsx":"^4","typescript":"^5"},"engines":{"node":">=20"},"files":["dist","server.json"],"homepage":"https://github.com/CloudCorpRecords/hookcheck#readme","license":"MIT","mcpName":"io.github.CloudCorpRecords/hookcheck","name":"@reneturcios/hookcheck","private":false,"publishConfig":{"access":"public"},"repository":{"type":"git","url":"git+https://github.com/CloudCorpRecords/hookcheck.git"},"scripts":{"build":"tsc","dev":"tsx src/cli.ts","test":"tsx --test test/*.test.ts"},"type":"module","version":"0.1.3"}
+{
+  "bin": {
+    "hookcheck": "dist/cli.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1",
+    "zod": "^3"
+  },
+  "description": "AI persistence hook auditor: scan a repo for auto-exec hooks (npm install scripts, Claude Code hooks, VS Code folderOpen tasks, husky, MCP autostart) and flag Shai-Hulud style persistence patterns.",
+  "devDependencies": {
+    "@types/node": "^20",
+    "tsx": "^4",
+    "typescript": "^5"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "server.json"
+  ],
+  "homepage": "https://github.com/CloudCorpRecords/hookcheck#readme",
+  "license": "MIT",
+  "mcpName": "io.github.CloudCorpRecords/hookcheck",
+  "name": "@reneturcios/hookcheck",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CloudCorpRecords/hookcheck.git"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "type": "module",
+  "version": "0.1.4"
+}

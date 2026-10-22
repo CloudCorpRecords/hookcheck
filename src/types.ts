@@ -49,6 +49,13 @@ export interface ScanReport {
   counts: { total: number; safe: number; risky: number; unknown: number };
   warnings: string[];
   scannedAt: string;
+  /**
+   * Present when nothing was found to audit (total 0): the note states
+   * plainly that the verdict covers an empty estate, so a hook-free repo,
+   * an empty directory, and a wrong path do not read as an all-clear
+   * (P-014, mirroring the actionpin fix).
+   */
+  note?: string;
 }
 
 export interface ExplainResult {
