@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.16 (2026-10-22)
+
+P-074 completion, found at the v0.1.15 acceptance pass (5 new tests in test/v0116.test.ts, 340 total; the 3 new-behavior tests fail on 0.1.15 for exactly this reason, both controls already held):
+
+- The chaos hostile-fs shapes put the symbolic link AT the surface path itself: .claude -> /nonexistent, .husky -> /nonexistent, .pre-commit-config.yaml -> /nonexistent. Those stayed silent on 0.1.15 (verdict CLEAN, warnings []): the discovery walk never descends into dot-named directories (they are surface containers, scanned directly), and the surface scanners key off existence checks that are false for a dangling link, so the surface vanished without a word. A sweep now lstats every surface path at every project root before scanning; a surface path that is a symbolic link whose target cannot be resolved earns one warning naming the path and the reason (Unreadable surface skipped: <path> is a symbolic link that could not be resolved (<code>); it was not inventoried), in JSON and human output, and the verdict floors at REVIEW under the partial-scan precedent. A link that does resolve keeps the long-standing behavior: the surface scanners follow it (a repo may legitimately symlink its own hooks directory), with no warning; both directions are pinned by tests.
+
 ## 0.1.15 (2026-10-22)
 
 Security Wave Fix Pass 2, release 2 (validation/problems.md P-070, P-075, P-073, P-074, P-076). Reproduced on the published 0.1.14 before fixing (14 new tests in test/v0115.test.ts, 335 total; 8 fail on 0.1.14 for exactly the ledger reasons, the controls and the P-073 pin already held):

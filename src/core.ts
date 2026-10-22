@@ -8,7 +8,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type { Classification, HookFinding, HookSource, ScanReport, Verdict } from "./types.js";
 
-export const VERSION = "0.1.15";
+export const VERSION = "0.1.16";
 
 interface RuleDef {
   id: string;
@@ -3573,6 +3573,49 @@ function aggregateSafeFindings(findings: HookFinding[]): { findings: HookFinding
  */
 export const EMPTY_ESTATE_NOTE = "Nothing was found to audit: no auto-exec hooks were inventoried under this path, so the verdict covers an empty estate. This can mean a hook-free repo, an empty directory, or a path that is not a repo root.";
 
+/**
+ * Surface paths checked for unresolvable symbolic links at every
+ * project root before scanning (P-074 completion, v0.1.16). The
+ * discovery walk never descends into dot-named directories (they
+ * are surface containers, scanned directly), and the surface
+ * scanners key off existence checks that are false for a dangling
+ * link, so a link planted AT a surface path (.claude ->
+ * /nonexistent, .husky -> /nonexistent, .pre-commit-config.yaml ->
+ * /nonexistent; the chaos hostile-fs shapes) made the surface
+ * vanish silently on 0.1.15: verdict CLEAN, warnings []. The sweep
+ * lstats each surface path; a path that is a symbolic link whose
+ * target cannot be resolved earns one warning naming the path and
+ * the reason. A link that DOES resolve keeps the long-standing
+ * behavior: the surface scanners follow it (a repo may
+ * legitimately symlink its own hooks directory), with no warning.
+ */
+const SURFACE_LINK_PATHS = [
+  ".github", ".claude", "claude", ".vscode", ".husky", ".githooks",
+  ".cursor", ".codex", "package.json", ".pre-commit-config.yaml",
+  "lefthook.yml", "lefthook.yaml", ".lefthook.yml", ".mcp.json", "mcp.json",
+  ".claude/settings.json", ".claude/settings.local.json",
+];
+
+function warnUnresolvableSurfaceLinks(root: string, disc: Discovery, warnings: string[]): void {
+  const warned = new Set<string>();
+  for (const prefix of disc.projectRoots) {
+    const base = prefix === "" ? "" : `${prefix}/`;
+    const baseAbs = prefix === "" ? root : join(root, prefix);
+    for (const rel of SURFACE_LINK_PATHS) {
+      const abs = join(baseAbs, rel);
+      let lst; try { lst = lstatSync(abs); } catch { continue; }
+      if (!lst.isSymbolicLink()) continue;
+      try { statSync(abs); continue; } catch (err) {
+        const name = `${base}${rel}`;
+        if (warned.has(name)) continue;
+        warned.add(name);
+        const code = (err as NodeJS.ErrnoException | undefined)?.code ?? "error";
+        warnings.push(`Unreadable surface skipped: ${name} is a symbolic link that could not be resolved (${code}); it was not inventoried`);
+      }
+    }
+  }
+}
+
 export function scanHooks(root: string): ScanReport {
   const findings: HookFinding[] = [];
   const warnings: string[] = [];
@@ -3597,6 +3640,7 @@ export function scanHooks(root: string): ScanReport {
     };
   }
   const disc = discoverSurfaces(root, warnings);
+  warnUnresolvableSurfaceLinks(root, disc, warnings);
   const state: ScanState = { disc, inventoried: new Set<string>(), familyFound: new Map(), familyCapped: new Map(), partial: false };
   scanPackageJson(root, findings, warnings, state);
   scanClaude(root, findings, warnings, state);
