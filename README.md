@@ -130,3 +130,8 @@ npm test
 ## License
 
 MIT
+
+---
+
+Built by [Rene Turcios](https://github.com/CloudCorpRecords) — vibe coder / agent-native dev building in public in SF. If hookcheck saved you time, star this repo and [follow @CloudCorpRecords](https://github.com/CloudCorpRecords) for the next tool.
+The family: [greenlight](https://github.com/CloudCorpRecords/greenlight) · [injectcheck](https://github.com/CloudCorpRecords/injectcheck) · [actionpin](https://github.com/CloudCorpRecords/actionpin) · [shipcheck](https://github.com/CloudCorpRecords/shipcheck) — all on npm under `@reneturcios/` and in the official MCP Registry.
