@@ -8,7 +8,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type { Classification, HookFinding, HookSource, ScanReport, Verdict } from "./types.js";
 
-export const VERSION = "0.1.17";
+export const VERSION = "0.1.18";
 
 interface RuleDef {
   id: string;
@@ -945,12 +945,19 @@ function buildViews(text: string, lang: Lang): Views {
   return { codeText, credText: blankRanges(text, credBlank), dataRanges, urlText: urlChars.join("") };
 }
 
+/**
+ * The .npmrc pattern is named because one position of that file is
+ * an authentication position, not a credential store disclosure
+ * (P-185, see npmrcRedirectTargets and detectCredAccess).
+ */
+const NPMRC_FILE_PATTERN = /\.npmrc\b/;
+
 const CRED_FILE_PATTERNS: RegExp[] = [
   /~\/\.ssh(\/|\s|$|["'])/, /\$HOME\/\.ssh(\/|\s|$|["'])/, /(^|[\s"'(=])\.ssh\//,
   /\.aws\/credentials\b/, /\.aws\/config\b/,
   /~\/\.gnupg(\/|\s|$|["'])/, /\$HOME\/\.gnupg(\/|\s|$|["'])/, /\/\.gnupg\//,
   /(^|[\s"'(=\/])(id_rsa|id_ed25519|id_ecdsa|id_dsa)(\.pub)?\b/,
-  /\.npmrc\b/, /\.netrc\b/,
+  NPMRC_FILE_PATTERN, /\.netrc\b/,
   /credentials\.(json|ya?ml|toml|ini|xml|env)\b/,
   /(^|[\s"'(=\/])credentials(?=$|[\s;|&)"'])/,
   /\/\.config\/gh\//,
@@ -959,14 +966,144 @@ const CRED_FILE_PATTERNS: RegExp[] = [
 ];
 
 /**
+ * Script filename spans in linear time (P-176). The filename patterns
+ * this replaces were written as a greedy character class prefix plus
+ * a literal dot and an extension alternation:
+ *   /[A-Za-z0-9_.\/-]+\.(?:sh|bash|...)\b/g
+ * On a long token carrying no script extension (one 50,000 character
+ * run of the letter A in a workflow run step) the regex engine tries
+ * every start position and backtracks the greedy prefix one character
+ * at a time from each, which is quadratic in the token length: the
+ * 0.1.17 scan of that step took 32.6 s standalone. CPU profiling
+ * attributed 87.5 percent of classify time to that one pattern.
+ *
+ * The scanner below reproduces the pattern semantics exactly while
+ * staying linear. Text is walked once as maximal runs of the
+ * pattern's character class. Inside a run, a match starting at the
+ * current scan position is what the greedy engine finds: the longest
+ * prefix (at least one class character) that ends just before a dot
+ * whose extension matches and is followed by a word boundary (the
+ * next character is not a letter, digit, or underscore; a dot, slash,
+ * or dash after the extension is a boundary, as is the run edge,
+ * because the character past a maximal run is never a word
+ * character). If no dot in the remainder of the run qualifies, no
+ * later start position in the run can match either (its candidate
+ * dots are a subset), so the run is done. Matches never overlap and
+ * scanning resumes at each match end, exactly like the global regex.
+ */
+const SCRIPT_EXT_CRED_SCRUB = ["sh", "bash", "zsh", "mjs", "cjs", "js", "ts", "py", "ps1"];
+const SCRIPT_EXT_TOKENS = ["mjs", "cjs", "js", "ts", "sh", "py"];
+
+function isScriptNameChar(code: number): boolean {
+  return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122)
+    || code === 95 || code === 46 || code === 47 || code === 45; // _ . / -
+}
+
+function isWordChar(code: number): boolean {
+  return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95;
+}
+
+/** End index (exclusive) of the extension match after the dot at dotIdx, or -1. */
+function scriptExtEnd(text: string, dotIdx: number, exts: string[]): number {
+  for (const ext of exts) {
+    if (!text.startsWith(ext, dotIdx + 1)) continue;
+    const end = dotIdx + 1 + ext.length;
+    if (end >= text.length || !isWordChar(text.charCodeAt(end))) return end;
+  }
+  return -1;
+}
+
+function scriptNameSpans(text: string, exts: string[]): Array<{ start: number; end: number }> {
+  const spans: Array<{ start: number; end: number }> = [];
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    if (!isScriptNameChar(text.charCodeAt(i))) { i++; continue; }
+    let runEnd = i + 1;
+    while (runEnd < n && isScriptNameChar(text.charCodeAt(runEnd))) runEnd++;
+    let s = i;
+    while (s < runEnd) {
+      let end = -1;
+      for (let d = runEnd - 1; d > s; d--) {
+        if (text[d] !== ".") continue;
+        const e = scriptExtEnd(text, d, exts);
+        if (e !== -1) { end = e; break; }
+      }
+      if (end === -1) break;
+      spans.push({ start: s, end });
+      s = end;
+    }
+    i = runEnd;
+  }
+  return spans;
+}
+
+/** The script filename tokens of a command, in order (the SCRIPT_TOKEN_RE matches). */
+function scriptTokens(text: string): string[] {
+  return scriptNameSpans(text, SCRIPT_EXT_TOKENS).map((sp) => text.slice(sp.start, sp.end));
+}
+
+/**
+ * The npmrc publish-auth position (P-185). The canonical npm publish
+ * step in a release workflow writes the repo's publish token into
+ * ~/.npmrc, the npm client's own auth file, as a redirection target:
+ *   echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" >> ~/.npmrc
+ * That occurrence of the .npmrc path is the credential being
+ * PRESENTED to its own client, an authentication position in the
+ * same family as an Authorization header value or a curl -u pair,
+ * not a disclosure of a credential store: nothing is read from the
+ * store, and the value written comes from the workflow's own secret.
+ * On 0.1.17 the bare .npmrc pattern counted that write as credential
+ * store access, and combined with the registry URL in the same step
+ * (REMOTE-URL) it drove COMPROMISED-PATTERN on
+ * langchain-ai/langchainjs, whose only 2 RISKY findings in 82 were
+ * this textbook step. Ranges returned here cover the .npmrc
+ * occurrences that are the target of a > or >> redirection (with an
+ * optional quote and a ~, $HOME, or ${HOME} prefix); every other
+ * .npmrc occurrence (a cat, a copy source, a curl -d @ file, a grep
+ * operand) is untouched and keeps counting as credential store
+ * access, and the exfil analysis is unaffected, so the same token
+ * posted to an external URL still fires ENV-EXFIL and store contents
+ * piped into a send still fire CRED-EXFIL.
+ */
+function npmrcRedirectTargets(text: string): TextRange[] {
+  const ranges: TextRange[] = [];
+  for (const m of text.matchAll(/>>?\s*["']?(?:~|\$HOME|\$\{HOME\})\/\.npmrc\b/g)) {
+    const at = m.index + m[0].indexOf(".npmrc");
+    ranges.push({ start: at, end: at + ".npmrc".length });
+  }
+  return ranges;
+}
+
+/**
  * Credential store access, matched on content and paths (P-004). Script
  * filenames are scrubbed first: a hook that runs a script named like
  * configure_git_credentials.sh is classified by that script's contents
  * (one hop), never by the word credentials inside its filename.
  */
 function detectCredAccess(cmd: string): boolean {
-  const scrubbed = cmd.replace(/[A-Za-z0-9_.\/-]+\.(?:sh|bash|zsh|mjs|cjs|js|ts|py|ps1)\b/g, " ");
-  return CRED_FILE_PATTERNS.some((p) => p.test(scrubbed));
+  const spans = scriptNameSpans(cmd, SCRIPT_EXT_CRED_SCRUB);
+  let scrubbed = cmd;
+  if (spans.length > 0) {
+    let out = "";
+    let cur = 0;
+    for (const sp of spans) { out += cmd.slice(cur, sp.start) + " "; cur = sp.end; }
+    scrubbed = out + cmd.slice(cur);
+  }
+  return CRED_FILE_PATTERNS.some((p) => {
+    if (p === NPMRC_FILE_PATTERN) {
+      // P-185: an .npmrc occurrence that is only a redirection
+      // target (the publish-auth write) is an authentication
+      // position and does not count; any other occurrence does.
+      const authTargets = npmrcRedirectTargets(scrubbed);
+      if (authTargets.length === 0) return p.test(scrubbed);
+      for (const m of scrubbed.matchAll(/\.npmrc\b/g)) {
+        if (!authTargets.some((r) => (m.index ?? 0) >= r.start && (m.index ?? 0) < r.end)) return true;
+      }
+      return false;
+    }
+    return p.test(scrubbed);
+  });
 }
 
 const CRED_ENV_NAME = /(SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|ACCESS_?KEY|CREDENTIAL|AUTH_?KEY|SESSION_?KEY)/i;
@@ -2452,8 +2589,6 @@ export function classifyCommand(command: string, lang: Lang = "shell"): { classi
   return { classification: "UNKNOWN", rules: [], evidence: "no known safe pattern and no risky pattern matched; manual review needed" };
 }
 
-const SCRIPT_TOKEN_RE = /[A-Za-z0-9_.\/-]+\.(?:mjs|cjs|js|ts|sh|py)\b/g;
-
 /**
  * Second hop detection (P-031). The one hop limit means a payload two
  * files deep is never read, and that limit is documented. What was not
@@ -2473,7 +2608,7 @@ function secondHopScripts(scanRootAbs: string, baseAbs: string, content: string,
   const text = stripComments(content);
   const found = new Set<string>();
   const collectFrom = (segText: string): void => {
-    for (const tok of segText.match(SCRIPT_TOKEN_RE) ?? []) found.add(tok);
+    for (const tok of scriptTokens(segText)) found.add(tok);
   };
   // Exec style call spans: everything up to the matching close paren.
   const callRe = /\b(?:execSync|execFileSync|execSync|execFile|spawnSync|spawn|exec|system|popen|Popen|runInThisContext|runInNewContext)\s*\(/g;
@@ -2518,7 +2653,7 @@ function secondHopScripts(scanRootAbs: string, baseAbs: string, content: string,
  * but the head can no longer be affirmatively cleared.
  */
 function escalateWithLocalFile(root: string, finding: HookFinding, baseAbs: string = root): HookFinding {
-  const tokens = Array.from(new Set(finding.command.match(SCRIPT_TOKEN_RE) ?? [])).slice(0, 5);
+  const tokens = Array.from(new Set(scriptTokens(finding.command))).slice(0, 5);
   if (tokens.length === 0) return finding;
   const rootAbs = resolve(root);
   const baseResolved = resolve(baseAbs);
@@ -2848,7 +2983,33 @@ function scanOnePackageJson(root: string, rel: string, findings: HookFinding[], 
   const baseAbs = dirname(join(root, rel));
   for (const name of watched) {
     const cmd = scripts[name];
-    if (typeof cmd === "string" && cmd.trim()) {
+    if (cmd === undefined) continue;
+    if (typeof cmd !== "string") {
+      // A watched script entry that is not a string (P-180): the
+      // entry exists, so an install time hook slot is occupied, but
+      // its value (a number, an object, null, a boolean, an array)
+      // cannot be classified as a command. Before v0.1.18 it was
+      // silently ignored: CLEAN, findings 0, warnings empty. It now
+      // warns by name and is inventoried as an UNKNOWN finding, so
+      // the verdict floors at REVIEW under the ordinary UNKNOWN rule
+      // and the partial scan doctrine, and the entry stays visible
+      // in the inventory instead of vanishing.
+      const typeName = cmd === null ? "null" : Array.isArray(cmd) ? "array" : typeof cmd;
+      const shown = (typeof cmd === "object" ? JSON.stringify(cmd) ?? String(cmd) : String(cmd)).slice(0, 200);
+      warnings.push(`Unclassifiable script in ${rel}: scripts.${name} is not a string (got ${typeName}); the entry was inventoried as unclassifiable`);
+      findings.push({
+        id: `${rel}:${name}`,
+        file: rel,
+        source: "package.json",
+        hook: name,
+        command: shown,
+        classification: "UNKNOWN",
+        rules: [],
+        evidence: `scripts.${name} in ${rel} has a non-string value (${typeName}), so the install hook entry exists but cannot be classified; manual review needed`,
+      });
+      continue;
+    }
+    if (cmd.trim()) {
       const finding = makeFinding(root, rel, "package.json", name, cmd, undefined, undefined, baseAbs);
       findings.push(escalateWithScriptChain(root, scripts, name, finding, baseAbs));
     }
@@ -2937,8 +3098,21 @@ function discoverSurfaces(root: string, warnings: string[]): Discovery {
   while (stack.length > 0) {
     const cur = stack.pop() as { abs: string; rel: string; depth: number };
     let entries: string[] = [];
-    try { entries = readdirSync(cur.abs); } catch {
-      if (cur.rel) warnings.push(`Unreadable directory skipped: ${cur.rel} could not be listed; the scan is partial`);
+    try { entries = readdirSync(cur.abs); } catch (err) {
+      // The scan root itself is not exempt (P-170): before v0.1.18 the
+      // root entry (rel "") pushed no warning at all, so a target the
+      // walker could not list (chmod 000 read by a non-root user)
+      // verdicted CLEAN with findings 0 and warnings empty, while an
+      // unreadable file inside a readable directory floored at REVIEW
+      // with a warning and a missing path returned REVIEW plus a
+      // warning. The unlistable root now warns the same way, and the
+      // partial scan floor in scanHooks does the rest.
+      if (cur.rel) {
+        warnings.push(`Unreadable directory skipped: ${cur.rel} could not be listed; the scan is partial`);
+      } else {
+        const code = (err as NodeJS.ErrnoException | undefined)?.code ?? "error";
+        warnings.push(`Unreadable directory skipped: the scan root ${root} could not be listed (${code}); the scan is partial`);
+      }
       continue;
     }
     entries.sort();
@@ -3719,6 +3893,36 @@ function warnUnresolvableSurfaceLinks(root: string, disc: Discovery, warnings: s
   }
 }
 
+/**
+ * True when a warning says a named surface could not be inventoried
+ * (P-171, generalizing the P-074 floor). Before v0.1.18 the partial
+ * scan floor in scanHooks matched only warnings starting with
+ * Unreadable or Symlinked directory skipped, so three named surfaces
+ * that DID warn by name kept a bare CLEAN verdict: a malformed
+ * .claude/settings.json holding an evil SessionStart hook (warning
+ * prefix Malformed JSON), settings.json existing as a directory
+ * (warning states it is a directory, not a settings file), and
+ * settings.json as a FIFO (warning prefix Non-regular). The doctrine
+ * is uniform: any named surface that could not be inventoried floors
+ * the verdict at REVIEW, the same floor an unreadable package.json
+ * already had. Warnings that do NOT floor are the ones where the
+ * surface was inventoried and found empty of the watched content (a
+ * settings file with no hooks key), plus the cap and depth bound
+ * warnings, which floor through state.partial and the below-bound
+ * surface count instead.
+ */
+function warningIsSkippedSurface(w: string): boolean {
+  return w.startsWith("Unreadable")
+    || w.startsWith("Symlinked directory skipped")
+    || w.startsWith("Non-regular")
+    || w.startsWith("Malformed JSON in ")
+    || w.startsWith("Could not parse ")
+    || w.includes("is a directory, not a settings file")
+    || w.includes("is not a JSON object: file skipped")
+    || w.includes("is not an object: ")
+    || w.includes("is not an array: tasks skipped");
+}
+
 export function scanHooks(root: string): ScanReport {
   const findings: HookFinding[] = [];
   const warnings: string[] = [];
@@ -3795,15 +3999,17 @@ export function scanHooks(root: string): ScanReport {
   // aggregation (P-070): collapsing repeated SAFE records for
   // presentation must never move a verdict or an exit code.
   let verdict = computeVerdict(deduped);
-  // Partial scan floor (P-049, extended by P-065 and P-074): when any
-  // inventoried file or directory could not be read, when a file cap
-  // left surface files uninventoried, when hook surfaces were
-  // spotted just below the discovery depth bound, or when a
-  // symlinked directory was skipped under the no-follow policy, the
-  // scan did not see the whole estate, so a bare CLEAN is not an
-  // honest verdict. Floor at REVIEW; the warnings name exactly what
-  // was missed.
-  if (verdict === "CLEAN" && (warnings.some((w) => w.startsWith("Unreadable") || w.startsWith("Symlinked directory skipped")) || state.partial || disc.surfacesBelowBound > 0)) {
+  // Partial scan floor (P-049, extended by P-065 and P-074, and
+  // generalized by P-171): when any named surface could not be
+  // inventoried (warningIsSkippedSurface: an unreadable file or
+  // directory, a non-regular file, a malformed JSON surface, a
+  // settings path that is a directory, a skipped symlinked
+  // directory), when a file cap left surface files uninventoried, or
+  // when hook surfaces were spotted just below the discovery depth
+  // bound, the scan did not see the whole estate, so a bare CLEAN is
+  // not an honest verdict. Floor at REVIEW; the warnings name
+  // exactly what was missed.
+  if (verdict === "CLEAN" && (warnings.some(warningIsSkippedSurface) || state.partial || disc.surfacesBelowBound > 0)) {
     verdict = "REVIEW";
   }
   const { findings: reported, aggregation } = aggregateSafeFindings(deduped);

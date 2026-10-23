@@ -17,10 +17,10 @@
       "transport": {
         "type": "stdio"
       },
-      "version": "0.1.17"
+      "version": "0.1.18"
     },
     {
-      "identifier": "ghcr.io/cloudcorprecords/hookcheck:0.1.17",
+      "identifier": "ghcr.io/cloudcorprecords/hookcheck:0.1.18",
       "packageArguments": [
         {
           "type": "positional",
@@ -48,5 +48,5 @@
     "source": "github",
     "url": "https://github.com/CloudCorpRecords/hookcheck"
   },
-  "version": "0.1.17"
+  "version": "0.1.18"
 }
