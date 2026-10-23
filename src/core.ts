@@ -8,7 +8,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type { Classification, HookFinding, HookSource, ScanReport, Verdict } from "./types.js";
 
-export const VERSION = "0.1.16";
+export const VERSION = "0.1.17";
 
 interface RuleDef {
   id: string;
@@ -2218,6 +2218,92 @@ const SAFE_PATTERNS: RegExp[] = [
  * file parsers in wshobson/agents) downloads nothing and is not
  * download-exec; labeling it RISKY was pure noise.
  */
+/**
+ * Fetch plus eval value flow (incident validation 2026-10-22, the zod
+ * reconstruction). detectDownloadExec above covers only INLINE code:
+ * a node -e or python -c literal that itself references the network.
+ * The classic install time loader is not inline: a referenced local
+ * file fetches remote code and evaluates the RESPONSE, mediated by
+ * variables (const res = await fetch(url); const code = await
+ * res.text(); eval(code)). The REMOTE-EVAL pattern misses that shape
+ * twice over: it looks for curl, wget, or fetch text within a short
+ * forward window of the eval token, and the fetched content reaches
+ * eval through variable bindings, not adjacent text.
+ *
+ * This detector follows the value, in the style of the ENV-EXFIL
+ * flow analysis. A variable is fetch derived when its assignment
+ * right hand side contains a network call (fetch, http get or
+ * request, axios, requests, httpx, urlopen, XMLHttpRequest, or a
+ * curl or wget word), or references a fetch derived variable (a
+ * response body read such as res.text() is the canonical second
+ * hop). An eval style call (eval, Function, exec, or a vm runIn
+ * context call) fires when its argument contains a network call
+ * directly, or references a fetch derived variable at a genuine
+ * reference position. A fetch whose result is only logged or parsed
+ * as data never reaches an eval call and does not fire; an eval of
+ * a constant, or of a variable with no fetch in its derivation,
+ * does not fire either. A dotted .exec( or .eval( is a method call
+ * on some object (a RegExp exec parses data, it does not run it)
+ * and is not an eval style call here; the vm runIn forms are the
+ * one dotted family that counts, by name.
+ *
+ * The detector runs on the code view: comments are already
+ * stripped and data literals are already blanked (a comment only
+ * loader stub that describes this shape in prose fires nothing),
+ * while literals handed to eval style calls are spliced back as
+ * code by the view builder, so eval of a string that itself calls
+ * fetch still counts as the direct form.
+ */
+const FETCH_CALL_RE = /\bfetch\s*\(|\bhttps?\s*\.\s*(?:get|request)\s*\(|\baxios(?:\s*\.\s*\w+)?\s*\(|\brequests\s*\.\s*(?:get|post|request)\s*\(|\bhttpx\s*\.\s*(?:get|post|request)\s*\(|\burlopen\s*\(|\bXMLHttpRequest\b|\bcurl\b|\bwget\b/;
+
+function fetchDerivedVars(codeText: string): Set<string> {
+  const tainted = new Set<string>();
+  const assignRe = /(?:^|[;\n,])\s*(?:export\s+|const\s+|let\s+|var\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*=(?![=<>])\s*/g;
+  const assigns: Array<{ name: string; rhsStart: number; rhsEnd: number }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = assignRe.exec(codeText)) !== null) {
+    const rhsStart = m.index + m[0].length;
+    let rhsEnd = rhsStart;
+    while (rhsEnd < codeText.length && codeText[rhsEnd] !== ";" && codeText[rhsEnd] !== "\n") rhsEnd++;
+    assigns.push({ name: m[1], rhsStart, rhsEnd });
+  }
+  for (let pass = 0; pass < 4; pass++) {
+    for (const a of assigns) {
+      if (tainted.has(a.name)) continue;
+      const rhs = codeText.slice(a.rhsStart, a.rhsEnd);
+      if (FETCH_CALL_RE.test(rhs)) { tainted.add(a.name); continue; }
+      for (const v of tainted) {
+        if (refPositions(rhs, v, a.rhsStart, []).length > 0) { tainted.add(a.name); break; }
+      }
+    }
+  }
+  return tainted;
+}
+
+function detectFetchEval(codeText: string): boolean {
+  if (!FETCH_CALL_RE.test(codeText)) return false;
+  const evalRe = /\b(?:eval|Function|exec|runInThisContext|runInNewContext|runInContext)\s*\(/g;
+  const tainted = fetchDerivedVars(codeText);
+  let m: RegExpExecArray | null;
+  while ((m = evalRe.exec(codeText)) !== null) {
+    const isVmForm = m[0].startsWith("runIn");
+    // A dotted call is a method on an object, not the global eval
+    // or exec, except for the vm runIn family, which is dotted by
+    // construction (vm.runInThisContext).
+    if (!isVmForm && m.index > 0 && codeText[m.index - 1] === ".") {
+      if (!/\bvm\s*\.\s*$/.test(codeText.slice(Math.max(0, m.index - 8), m.index))) continue;
+    }
+    const open = m.index + m[0].length - 1;
+    const span = callSpan(codeText, open);
+    const arg = codeText.slice(span.start, span.end);
+    if (FETCH_CALL_RE.test(arg)) return true;
+    for (const v of tainted) {
+      if (refPositions(arg, v, span.start, []).length > 0) return true;
+    }
+  }
+  return false;
+}
+
 function detectDownloadExec(codeText: string): boolean {
   const re = /\b(?:node|bun)\s+-(?:e|-eval)\b|\bdeno\s+eval\b|\bpython3?\s+-c\b/g;
   const netRef = /https?:\/\/|\bfetch\s*\(|\bcurl\b|\bwget\b|\brequests\b|urllib|urlopen|\baxios\b|https?\s*\.\s*(?:get|request)|XMLHttpRequest|\bnet\s*\.\s*connect|\bsocket\b/i;
@@ -2288,6 +2374,23 @@ export function classifyCommand(command: string, lang: Lang = "shell"): { classi
   }
   if (detectDownloadExec(views.codeText)) {
     fired.push({ id: "DOWNLOAD-EXEC", evidence: "executes inline code that itself downloads or references remote content" });
+  }
+  // Fetch plus eval flow (incident validation 2026-10-22): fetched
+  // content reaching an eval style call, directly or through
+  // variables, is the download-and-execute loader shape. The pair
+  // fires DOWNLOAD-EXEC (the class name for the shape) and
+  // REMOTE-EVAL, which is the severe rule for evaluated fetched
+  // content and is what carries the verdict: DOWNLOAD-EXEC on its
+  // own stays a non driver at the verdict layer (P-109d, the inline
+  // shape), while a flow verified fetch to eval combination is
+  // strong evidence of exactly the kind path (a) names.
+  if (detectFetchEval(views.codeText)) {
+    if (!fired.some((f) => f.id === "DOWNLOAD-EXEC")) {
+      fired.push({ id: "DOWNLOAD-EXEC", evidence: "fetches remote code and evaluates it as code: the fetched content reaches an eval style call, directly or through variables (download-and-execute loader)" });
+    }
+    if (!fired.some((f) => f.id === "REMOTE-EVAL")) {
+      fired.push({ id: "REMOTE-EVAL", evidence: "evaluates content fetched from the network as code" });
+    }
   }
   // Loopback downgrade (P-004): a fetch whose every URL is loopback is a
   // local health check shape, not a network exfil shape. Downgrade only
