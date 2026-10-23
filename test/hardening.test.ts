@@ -72,7 +72,7 @@ describe("hardening: malformed inputs never crash", () => {
     const post = r.findings.find((f) => f.hook === "postinstall");
     assert.ok(post && post.classification !== "UNKNOWN", `findings ${JSON.stringify(r.findings.map((f) => f.hook))}`);
     const unknown = r.findings.filter((f) => f.classification === "UNKNOWN");
-    assert.deepEqual(unknown.map((f) => f.hook).sort(), ["prepare", "preinstall"]);
+    assert.deepEqual(unknown.map((f) => f.hook).sort(), ["preinstall", "prepare"]);
     assert.equal(r.warnings.filter((w) => w.includes("is not a string")).length, 2);
   });
   it("package.json with scripts as a string warns and does not crash", () => {
