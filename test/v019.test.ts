@@ -287,7 +287,14 @@ describe("P-069: non-regular files are skipped by stat type before any open", ()
     const r = scanHooks(dir);
     assert.equal(r.counts.total, 1, `findings ${JSON.stringify(r.findings.map((f) => f.file))}`);
     assert.equal(r.findings[0].file, ".github/workflows/ci.yml");
-    assert.equal(r.verdict, "CLEAN");
+    // P-171 (v0.1.18): the verdict expectation moved from CLEAN to
+    // REVIEW. The FIFO is a named surface that could not be
+    // inventoried, and the generalized partial scan floor verdicts
+    // REVIEW for exactly that, the same shape as a FIFO at
+    // .claude/settings.json. The P-069 core of this test (no hang,
+    // remainder audited, warning emitted) is unchanged.
+    assert.equal(r.verdict, "REVIEW");
+    assert.ok(r.warnings.some((w) => w.includes("Non-regular")), `warnings ${JSON.stringify(r.warnings)}`);
   });
 
   it("a FIFO as the root package.json does not hang the scan", () => {
