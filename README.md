@@ -1,6 +1,14 @@
 # hookcheck
 
+[![npm version](https://img.shields.io/npm/v/@reneturcios/hookcheck.svg)](https://www.npmjs.com/package/@reneturcios/hookcheck) [![npm downloads](https://img.shields.io/npm/dm/@reneturcios/hookcheck.svg)](https://www.npmjs.com/package/@reneturcios/hookcheck) [![MCP Registry](https://img.shields.io/badge/MCP_Registry-io.github.CloudCorpRecords%2Fhookcheck-blue)](https://registry.modelcontextprotocol.io/)
+
 **Find the hooks that run before you do. One scan, every auto-exec surface, one verdict.**
+
+## Quickstart
+
+```bash
+npx @reneturcios/hookcheck scan ./some-repo
+```
 
 Modern supply chain attacks do not need you to run anything. They persist through hooks that run automatically: an npm `postinstall` script, a Claude Code `SessionStart` hook in `.claude/settings.json`, a VS Code task set to run on folder open. The Shai-Hulud npm worm used exactly this pattern, planting a preinstall dropper and then persisting through agent and editor hooks so it survived cleanup and stole credentials on the next open.
 
@@ -133,5 +141,7 @@ MIT
 
 ---
 
-Built by [Rene Turcios](https://github.com/CloudCorpRecords) — vibe coder / agent-native dev building in public in SF. If hookcheck saved you time, star this repo and [follow @CloudCorpRecords](https://github.com/CloudCorpRecords) for the next tool.
+Built by [Rene Turcios](https://github.com/CloudCorpRecords) — vibe coder / agent-native dev building in public in SF. [Follow @CloudCorpRecords](https://github.com/CloudCorpRecords) for the next tool.
 The family: [greenlight](https://github.com/CloudCorpRecords/greenlight) · [injectcheck](https://github.com/CloudCorpRecords/injectcheck) · [actionpin](https://github.com/CloudCorpRecords/actionpin) · [shipcheck](https://github.com/CloudCorpRecords/shipcheck) — all on npm under `@reneturcios/` and in the official MCP Registry.
+
+If hookcheck saved you time, star this repo: it helps other developers find it.
